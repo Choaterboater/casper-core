@@ -15,6 +15,8 @@ Phase 5: 0.1.0. The kernel, gate, CLI, approval broker, MCP server, and skill pa
 - Prints facts only: which checks ran, pass and fail counts, whether the proof held, which files changed, which declared requirements are still open.
 - Refuses. The gate has no path from `working` to `done` without evidence.
 
+It is a verifier, not a review. It shows that a check distinguishes a change; it cannot show that the check is worth running or that the change is good code. That limit is deliberate, and [docs/SOFTWARE-FACTORY.md](docs/SOFTWARE-FACTORY.md) maps the gate against the twelve software-factory practices it was measured against, including the ones it must not absorb.
+
 ## Install
 
 ```sh
