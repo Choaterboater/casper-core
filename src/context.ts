@@ -1,3 +1,4 @@
+import type { Action, Decision } from "./approvals/broker";
 import type { CommandSandbox } from "./sandbox/types";
 
 export interface Clock {
@@ -9,18 +10,9 @@ export interface Output {
   line(text: string): void;
 }
 
-export type ApprovalOutcome = "allow" | "ask" | "deny";
-
-export interface ApprovalRequest {
-  /** What would happen, in the user's words: "run bun test", "write /etc/hosts". */
-  action: string;
-  /** Why it is not routine, when it is not. */
-  reason?: string;
-}
-
-/** One broker, one table, three outcomes. The kernel never grows a second gate. */
-export interface ApprovalBroker {
-  decide(request: ApprovalRequest): ApprovalOutcome | Promise<ApprovalOutcome>;
+/** The kernel's view of the one broker: decide, and nothing else. */
+export interface Approvals {
+  decide(action: Action): Decision;
 }
 
 /**
@@ -41,7 +33,8 @@ export interface TaskContext {
   env?: NodeJS.ProcessEnv;
   output?: Output;
   clock?: Clock;
-  approvals?: ApprovalBroker;
+  /** The one approval broker. There is no second gate. */
+  approvals?: Approvals;
 }
 
 export const systemClock: Clock = { now: () => new Date() };

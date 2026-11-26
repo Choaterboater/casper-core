@@ -16,13 +16,14 @@ export type {
 
 export { contextClock, systemClock } from "./context";
 export type {
-  ApprovalBroker,
-  ApprovalOutcome,
-  ApprovalRequest,
+  Approvals,
   Clock,
   Output,
   TaskContext,
 } from "./context";
+
+export { ApprovalBroker, strictness } from "./approvals/broker";
+export type { Action, ActionKind, BrokerOptions, Decision, Mode, Outcome, Scope } from "./approvals/broker";
 
 export { changesCode, isCodePath, isTestPath } from "./code";
 export type { ChangedPaths } from "./code";

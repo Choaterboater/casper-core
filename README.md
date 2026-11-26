@@ -6,7 +6,7 @@ casper-core is not an agent. It does not plan, chat, or repair on its own. It is
 
 ## Status
 
-Phase 2: the kernel, the gate, the facts-only formatter, and the CLI work on a local workspace. The MCP server and skill pack land in Phase 4. Do not depend on this repository before 0.1.0.
+Phase 3: the kernel, the gate, the CLI, and the one approval broker work on a local workspace. The MCP server and skill pack land in Phase 4. Do not depend on this repository before 0.1.0.
 
 ## What it does
 
@@ -56,6 +56,14 @@ open requirements: none declared
 | `1` | checks failed |
 | `2` | unproven: checks pass, proof missing or failed |
 | `3` | could not run: no command, no baseline, environment problem |
+
+## Approvals
+
+One broker, three outcomes (`allow`, `ask`, `deny`), three modes (`read-only`, `ask`, `auto`), three scopes (`once`, `session`, `project`).
+
+- A read-only task asks nothing. A routine fix-test-commit task asks at most once.
+- An ask always has a scope and an off switch. A deny is reserved for irreversible or out-of-authority actions, and each one carries a written justification.
+- `tests/gate-parity.test.ts` compares the broker with Claude Code's default permission mode. casper-core may be less strict; being stricter fails the build unless the row carries an exception.
 
 ## Non-goals
 
