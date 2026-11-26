@@ -1,6 +1,6 @@
 {
   "name": "casper-core",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "An evidence gate: an external agent asks casper-core to verify a change, and casper-core answers with evidence or refuses.",
   "license": "MIT",
   "private": true,
@@ -14,7 +14,8 @@
     "lint": "oxlint",
     "test": "bun test",
     "mcp": "bun run src/mcp/server.ts",
-    "check": "bun run typecheck && bun run lint && bun run test"
+    "size": "bun run scripts/size-gate.ts",
+    "check": "bun run typecheck && bun run lint && bun run test && bun run size"
   },
   "devDependencies": {
     "@types/bun": "^1.4.5",

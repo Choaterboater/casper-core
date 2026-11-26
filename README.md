@@ -6,7 +6,7 @@ casper-core is not an agent. It does not plan, chat, or repair on its own. It is
 
 ## Status
 
-Phase 4: the kernel, the gate, the CLI, the approval broker, the MCP server, and the skill pack exist. Release 0.1.0 and three-platform CI land in Phase 5. Do not depend on this repository before 0.1.0.
+Phase 5: 0.1.0. The kernel, gate, CLI, approval broker, MCP server, and skill pack exist. CI runs the checks on macOS, Windows, and Linux.
 
 ## What it does
 
@@ -14,6 +14,17 @@ Phase 4: the kernel, the gate, the CLI, the approval broker, the MCP server, and
 - Proves the change matters: the check fails without the change and passes with it.
 - Prints facts only: which checks ran, pass and fail counts, whether the proof held, which files changed, which declared requirements are still open.
 - Refuses. The gate has no path from `working` to `done` without evidence.
+
+## Install
+
+```sh
+git clone https://github.com/Choaterboater/casper-core.git
+cd casper-core
+bun install
+bun link
+```
+
+`bun link` puts `casper` and `casper-mcp` on your PATH.
 
 ## Usage
 
