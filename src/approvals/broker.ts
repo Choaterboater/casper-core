@@ -172,7 +172,7 @@ export class ApprovalBroker {
       return this.ask("network", "it would reach the network", "session",
         "No leaves the network alone. Yes, for this session covers the rest of the session.");
     }
-    return this.ask(`${action.kind}-other`, `it would ${action.kind === "git" ? "change the repository" : "run a command"} outside the routine loop`, "session",
+    return this.ask(`${action.kind}-other`, "it would run a command outside the routine loop", "session",
       "No runs nothing. Yes, for this session covers the rest of the session. Auto mode stops asking.");
   }
 
