@@ -1,0 +1,245 @@
+import { KIND_ORDER, keepLiterally, replaceSpans, windowedSpans, type SecretKind } from "./patterns";
+import { isSecretKey, SECRET_MARKER, snakeKey, type ScrubTextResult } from "./scrub";
+
+/**
+ * Secret-named values in text: KEY=VALUE, key: value and "key": "value" lines, Authorization headers,
+ * user:password@ addresses and exact known values. Pure string work with no file or environment access,
+ * so other tools can copy this file as it is (GreenCLI does).
+ */
+
+/** Name parts that mean "the value is a secret". */
+const SECRET_PARTS = new Set(["password", "passwd", "passphrase", "pwd", "pass", "secret", "secrets", "token", "apikey", "psk",
+  "credential", "credentials", "bearer", "community", "privatekey", "accesskey", "secretkey", "authkey", "sessionkey", "signingkey"]);
+/** Two-part names: api_key, access_key, private_key, client_secret ... */
+const SECRET_PAIRS = /(?:^|_)(?:api|access|private|priv|secret|auth|session|signing|encryption|master|shared|pre_shared|client|app|account|service|webhook|consumer)_(?:key|secret|token)(?:_|$)/;
+/** A last name part that says the value is not the secret itself. */
+const NOT_SECRET_LAST = new Set(["url", "uri", "file", "path", "dir", "host", "hostname", "port", "endpoint", "expiry", "expires", "expiration",
+  "ttl", "type", "name", "id", "length", "len", "count", "enabled", "enable", "header", "prefix", "policy", "required", "min", "max", "env",
+  "var", "field", "label", "hint", "prompt", "rotation", "format", "help", "location", "region", "mode", "version", "at", "limit", "size",
+  "timeout", "user", "username", "cmd", "command", "helper", "method", "scope", "scopes", "audience", "issuer"]);
+/** Paging and usage words that end in "token" but are not logins. */
+const NOT_SECRET_ANY = /(?:^|_)(?:next|page|continuation|pagination|cursor|sync|resume|start|continue|max|input|output|total|csrf_field|num)(?:_|$)/;
+
+/** Whether a KEY=VALUE, key: value or "key": "value" name looks like it holds a secret. */
+export function isSecretName(name: string): boolean {
+  const key = snakeKey(name);
+  const parts = key.split("_").filter(Boolean);
+  // The shell's working folder, not a password.
+  if (!parts.length || key === "pwd" || key === "oldpwd") return false;
+  // A webhook or DSN address is itself the login: SLACK_WEBHOOK_URL, SENTRY_DSN.
+  if (parts.some((part) => part === "webhook" || part === "dsn") && ["webhook", "dsn", "url", "uri"].includes(parts.at(-1)!)) return true;
+  if (NOT_SECRET_LAST.has(parts.at(-1)!) || NOT_SECRET_ANY.test(key)) return false;
+  if (parts.some((part) => SECRET_PARTS.has(part))) return true;
+  if (SECRET_PAIRS.test(key)) return true;
+  // Glued names: MIST_APITOKEN, dbpassword, clientsecret.
+  return parts.some((part) => /(?:token|secret|password|passwd|passphrase|apikey)$/.test(part));
+}
+
+/** Words that are code or types, never a secret value, in command and grep output. */
+const CODE_WORDS = new Set(["str", "string", "int", "bool", "boolean", "number", "bytes", "none", "null", "nil", "true", "false", "undefined",
+  "any", "unknown", "object", "optional", "required", "self", "this", "secret", "password", "token", "changeme", "example", "xxx", "redacted"]);
+
+function kindFor(name: string): SecretKind {
+  const key = snakeKey(name);
+  if (/community/.test(key)) return "community";
+  if (/psk|passphrase/.test(key)) return "psk";
+  if (/pass|pwd/.test(key)) return "password";
+  return "key";
+}
+
+/** Is this unquoted value a literal (a real value), not code? Only asked for command output. */
+function literalValue(value: string, name: string, separator: string): boolean {
+  if (value.length < 4 || /[\s(){}[\]<>`]/.test(value) || /^[$%&@*]/.test(value)) return false;
+  // A negated name is still that name: `secret = !pagination`, `token = !this.enabled`.
+  const bare = value.replace(/^!+/, "");
+  if (CODE_WORDS.has(bare.toLowerCase())) return false;
+  // self.password, config.token, os.environ...
+  if (/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(bare)) return false;
+  // A bare identifier is a variable in code; it counts only in dotenv style (NAME=value, name upper case).
+  if (/^[A-Za-z_]+$/.test(bare)) return separator === "=" && /^[A-Z0-9_]+$/.test(name);
+  return true;
+}
+
+const ASSIGNMENT = /(^[-+]|^|[^\w.-])(["']?)([A-Za-z_][\w.-]*)\2(\s*)([=:])(\s*)("(?:[^"\\\n]|\\.)*"|'[^'\n]*'|[^\s"'][^\n]*)?/dg;
+/** An XML element on one line: <ApiKey>value</ApiKey>, <ns:Password>value</ns:Password>. */
+const XML_ELEMENT = /<((?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*))(?:\s[^<>]*)?>([^<>\n]+)<\/\1>/dg;
+const AUTH_HEADER = /\b(?:Bearer|Basic|Token)\s+([A-Za-z0-9._~+/-]{8,}=*)/dg;
+/** The same header named in any case: `authorization: bearer ...` (curl -v over HTTP/2), git's `extraheader = AUTHORIZATION: basic ...`. */
+const AUTH_HEADER_NAMED = /\b(?:proxy[-_]?)?authorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+([A-Za-z0-9._~+/-]{8,}=*)/dgi;
+
+/** A secret-named key, in any output: the names text uses (isSecretName) and the ones device JSON uses (isSecretKey). */
+export function isSecretKeyName(name: string): boolean {
+  return isSecretName(name) || isSecretKey(name);
+}
+
+/** A name whose last part is plain "key" (homepage.widget.key, <Key>): a secret only when its value looks like a generated key. */
+function plainKeyName(name: string): boolean {
+  const parts = snakeKey(name).split("_").filter(Boolean);
+  return parts.at(-1) === "key" && !parts.includes("public");
+}
+
+/** A value that only names a file (`secrets.yaml`, `config/keys.env`, `tls/server.key`): where a secret is kept, not the
+ * secret. Hiding `secrets: 'secrets.yaml'` cost a small model three turns working out what its own file was called. */
+function fileName(value: string): boolean {
+  return /^(?:[\w.-]+\/)*[\w-][\w.-]*\.(?:ya?ml|json|jsonc|toml|ini|env|conf|cfg|txt|pem|key|crt|cer|p12|pfx|db|sqlite3?|[cm]?js|ts|py|rb|sh|xml|csv|log|properties)$/i.test(value);
+}
+
+/** 16 or more letters and digits (base64 or hex, or a UUID) with at least 3 digits: not a word, a path, a date or a cache key such as v1-deps-1234. */
+function generatedKey(value: string): boolean {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  return (uuid || /^[A-Za-z0-9+/=]{16,}$/.test(value)) && /[A-Za-z]/.test(value) && (value.match(/\d/g)?.length ?? 0) >= 3;
+}
+
+/** Docker's "auth": base64 of user:password. */
+function basicLogin(value: string): boolean {
+  if (!/^[A-Za-z0-9+/]{8,}={0,2}$/.test(value)) return false;
+  let decoded: string;
+  try { decoded = atob(value); } catch { return false; }
+  return /^[\x20-\x7e]+:[\x20-\x7e]+$/.test(decoded);
+}
+
+interface Span { start: number; end: number; kind: SecretKind }
+
+function assignmentSpans(line: string, strict: boolean): Span[] {
+  const spans: Span[] = [];
+  ASSIGNMENT.lastIndex = 0;
+  for (let match = ASSIGNMENT.exec(line); match; match = ASSIGNMENT.exec(line)) {
+    const name = match[3]!;
+    const raw = match[7];
+    const indices = match.indices?.[7];
+    // Look for more pairs after this separator: "a=1, TOKEN=x" has two.
+    ASSIGNMENT.lastIndex = match.indices![5]![1];
+    const named = isSecretKeyName(name);
+    // Docker's "auth" (config.json, .dockercfg): a login only when it reads as one, or in a secret file.
+    const auth = !named && snakeKey(name) === "auth";
+    const keyed = !named && !auth && plainKeyName(name);
+    if (!raw || !indices || !(named || auth || keyed)) continue;
+    // A YAML tag that names a value kept elsewhere: Home Assistant's `api_key: !secret weather_key`, `!env_var`, Ansible's `!vault`.
+    if (/^!(?:secret|env_var|include|vault)\b/.test(raw)) continue;
+    // A file name inside a path is not a key: a compose volume `- /srv/secrets/api_token:/run/secrets/api_token:ro`.
+    if (!strict && (match[1] === "/" || match[1] === "\\")) continue;
+    // `grep password= src/`: a path or option after "name= " (no space before =, one after) is an argument, not the value.
+    // A quoted word or any other word there is still a value: `connect(password= 'x')`, `DB_PASSWORD= x`.
+    if (!strict && match[5] === "=" && !match[4] && match[6] && /^(?:[-.]|[^\s"']*\/)/.test(raw)) continue;
+    // "a == b" and "a := b" are comparisons or code, not stored values.
+    if (line[indices[0]] === "=" || (match[5] === ":" && line[match.indices![5]![1]] === "=")) continue;
+    // ok ? "pass" : "fail" is a ternary in grepped code: both sides are results, not a name and its value.
+    if (!strict && match[5] === ":" && /\?\s*$/.test(line.slice(0, match.indices![2]![0]))) continue;
+    // `printf 'HA_TOKEN: '; if [ -n "$HA_TOKEN" ] ...`: the name sits inside a shell quote, so the same quote right
+    // after it closes the name; it doesn't open a quoted value (that read the shell code up to the next quote).
+    if (!strict && (match[1] === "'" || match[1] === "\"") && raw[0] === match[1]) continue;
+    let [start, end] = indices;
+    let value = raw;
+    const quoted = value.length >= 2 && (value[0] === "\"" || value[0] === "'") && value.at(-1) === value[0];
+    if (quoted) { start++; end--; value = value.slice(1, -1); }
+    else {
+      // A name and value inside a shell quote ('token=abc' in a grep or a commit message): the value ends at that quote.
+      const opener = match[1];
+      if (opener === "'" || opener === "\"") {
+        const close = value.indexOf(opener);
+        if (close >= 0) { end = start + close; value = value.slice(0, close); }
+      }
+      // Unquoted: stop at a comment, a list separator or trailing space.
+      const cut = value.search(/\s+#|\s*[,;]\s*(?:$|["'\w])|\s+$/);
+      if (cut >= 0) { end = start + cut; value = value.slice(0, cut); }
+      // Command output: a value runs to the first space.
+      if (!strict) { const space = value.search(/\s/); if (space >= 0) { end = start + space; value = value.slice(0, space); } }
+    }
+    if (!value || keepLiterally(value) || value.includes(SECRET_MARKER) || fileName(value)) continue;
+    if (auth && !(strict || basicLogin(value))) continue;
+    if (keyed && !generatedKey(value)) continue;
+    if (!strict && !keyed && (quoted ? /\$\{|\{\{|^\s*$/.test(value) || value.length < 4 || CODE_WORDS.has(value.toLowerCase()) : !literalValue(value, name, match[5]!))) continue;
+    // In a secret file, a ${VAR} reference is not a value.
+    if (strict && /^\$\{?[A-Za-z_]\w*\}?$/.test(value)) continue;
+    spans.push({ start, end, kind: kindFor(name) });
+    ASSIGNMENT.lastIndex = Math.max(ASSIGNMENT.lastIndex, end);
+  }
+  // XML (an app's config.xml): the text of an element whose tag is a secret name, or "key" holding a generated key.
+  XML_ELEMENT.lastIndex = 0;
+  for (let match = XML_ELEMENT.exec(line); match; match = XML_ELEMENT.exec(line)) {
+    const tag = match[2]!;
+    const named = isSecretKeyName(tag);
+    const value = match[3]!.trim();
+    if (!value || keepLiterally(value) || value.includes(SECRET_MARKER) || /^\$\{?[A-Za-z_]\w*\}?$/.test(value)) continue;
+    if (named ? !strict && (/\$\{|\{\{/.test(value) || value.length < 4 || CODE_WORDS.has(value.toLowerCase())) : !(plainKeyName(tag) && generatedKey(value))) continue;
+    const start = match.indices![3]![0];
+    const lead = match[3]!.length - match[3]!.trimStart().length;
+    spans.push({ start: start + lead, end: start + lead + value.length, kind: named ? kindFor(tag) : "key" });
+  }
+  for (const header of [AUTH_HEADER, AUTH_HEADER_NAMED]) {
+    header.lastIndex = 0;
+    for (let match = header.exec(line); match; match = header.exec(line)) {
+      const [start, end] = match.indices![1]!;
+      // "authorization: basic auth is off" is a sentence: a plain lower-case word is not a credential.
+      if (header === AUTH_HEADER_NAMED && /^[a-z]+$/.test(match[1]!)) continue;
+      if (!keepLiterally(match[1]!)) spans.push({ start, end, kind: "key" });
+    }
+  }
+  return spans;
+}
+
+function applySpans(line: string, spans: Span[], kinds: Set<SecretKind>): { line: string; hidden: number } {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: Span[] = [];
+  for (const span of sorted) {
+    const last = merged.at(-1);
+    if (last && span.start < last.end) { last.end = Math.max(last.end, span.end); continue; }
+    merged.push({ ...span });
+  }
+  for (const span of merged) kinds.add(span.kind);
+  return { line: replaceSpans(line, merged, SECRET_MARKER), hidden: merged.length };
+}
+
+/**
+ * Hide values of secret-named keys: MIST_APITOKEN=abc123, password = x, "client_secret": "y",
+ * api_key: z, and Authorization: Bearer tokens. `strict` (a .env or credential file) hides every
+ * value of such a key; otherwise (command and grep output) only values that look like literals, so
+ * `token = getToken()` in grepped code stays as it is.
+ */
+export function scrubAssignments(text: string, strict: boolean): ScrubTextResult {
+  const lines = text.split("\n");
+  const kinds = new Set<SecretKind>();
+  let hidden = 0;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    const spans = windowedSpans(line, (part) => assignmentSpans(part, strict));
+    if (!spans.length) continue;
+    const result = applySpans(line, spans, kinds);
+    lines[index] = result.line;
+    hidden += result.hidden;
+  }
+  return { text: hidden ? lines.join("\n") : text, hidden, kinds: KIND_ORDER.filter((kind) => kinds.has(kind)) };
+}
+
+/** Hide every exact copy of the given values (for example `printenv OPENROUTER_API_KEY`). */
+export function scrubExactValues(text: string, values: readonly string[]): ScrubTextResult {
+  const wanted = [...new Set(values.filter((value) => value && text.includes(value)))].sort((a, b) => b.length - a.length);
+  if (!wanted.length) return { text, hidden: 0, kinds: [] };
+  // One pass over the text, longest value first at each place, and a marker already in the text is skipped over: a short
+  // value ("e") can't match inside the "<secret hidden>" that another value (or an earlier pass) left behind.
+  const pattern = new RegExp([SECRET_MARKER, ...wanted].map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g");
+  let hidden = 0;
+  const out = text.replace(pattern, (found) => {
+    if (found === SECRET_MARKER) return found;
+    hidden++;
+    return SECRET_MARKER;
+  });
+  return { text: out, hidden, kinds: hidden ? ["key"] : [] };
+}
+
+/**
+ * The password in an address such as postgres://admin:PASSWORD@db:5432/app. The match starts at "://" and a lookbehind
+ * checks the scheme before it: starting at the scheme re-read a long run of letters and dashes from every letter.
+ */
+const URL_PASSWORD = /:\/\/(?<=\b[a-z][a-z0-9+.-]*:\/\/)([^\s/@:'"]+:)([^\s/@'"]+)@/gi;
+
+/** Hide the password part of every user:password@ address, in any output. */
+export function scrubUrlPasswords(text: string): ScrubTextResult {
+  let hidden = 0;
+  const out = text.replace(URL_PASSWORD, (whole, user: string, password: string) => {
+    if (keepLiterally(password) || /^\$\{?\w+\}?$/.test(password) || password.includes(SECRET_MARKER)) return whole;
+    hidden++;
+    return `://${user}${SECRET_MARKER}@`;
+  });
+  return { text: hidden ? out : text, hidden, kinds: hidden ? ["password"] : [] };
+}

@@ -1,0 +1,1229 @@
+import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { privatePlaces, realpathLongest, windowsShellPath, within } from "../platform/paths";
+import { splitShell } from "../platform/shell";
+import { isOutside } from "../platform/inside";
+
+/**
+ * With no sandbox (Windows, bubblewrap missing), the AI's shell asks before each command. Two things keep that from
+ * becoming dozens of boxes a task: commands that only read (ls, git status, grep) run without asking, and a "don't ask
+ * again" answer covers that exact command, also inside a line of reads around it (answerKey).
+ * A text check, not a shell parser, and an allow-list: each program and git subcommand names the options it may have,
+ * and anything else (an unknown option, an arbitrary VAR=value start, expansion or ~) asks as before. Every file it names must
+ * really be in the project (links resolved) and not private; a search of a folder that holds a private place asks.
+ * A leading `cd` to a folder in the project is fine (later words are read from there), and a * or ? is expanded here,
+ * the way bash would, so each file it picks is checked.
+ */
+
+/** Where a read runs: the project, your home folder and the private places (the sandbox's denyRead). */
+/** `homeReads`: a plain read in your own folders under `home` (Documents, Projects…: not hidden ones, app data or home
+ * itself) counts as a read too, as the AI's read tool reads there. Only the no-sandbox shell box sets it
+ * (docs/adr/0002/46-home-reads.md); the reader, checks and routine work keep to the project. */
+export interface ReadPlace { root: string; home?: string; denyRead?: readonly string[]; homeReads?: boolean }
+
+interface Spec {
+  /** Option letters with no value; they may be grouped (-la). */
+  short?: string;
+  /** Option letters that take a value, joined (-n5) or as the next word (-n 5). */
+  value?: string;
+  /** Option letters whose value, if any, is joined (-uno). */
+  optional?: string;
+  /** Long options: "--x" takes no value, "--x=" takes one (--x=v or --x v). */
+  long?: readonly string[];
+  /** -5 means a count (head -5). */
+  number?: boolean;
+  /** Any option is fine (echo -n). */
+  anyOption?: boolean;
+  /** What the other words are: files to check, plain text, or nothing allowed. */
+  words?: "paths" | "text" | "none";
+  /** The first word is a pattern, unless one of these options gave it. */
+  pattern?: readonly string[];
+  /** Options whose value is a file to check. */
+  pathOptions?: readonly string[];
+  /** It reads whole folders: a folder holding a private place asks (and no folder means this one). */
+  recursive?: boolean | ((options: ReadonlySet<string>) => boolean);
+  /** It prints what is in the files it reads (grep, rg, git grep): a whole-folder read asks when a .env or key is inside. */
+  contents?: boolean;
+  /** git: the words may be pathspecs, which git expands itself (* ? [): one with such a character asks. */
+  pathspec?: boolean;
+  /** Words are only allowed with one of these options (git branch -l). */
+  wordsOnlyWith?: readonly string[];
+  maxWords?: number;
+  /** Every file word must be a regular file or not exist (a folder or a device asks). */
+  regularFiles?: boolean;
+  /** A last check on the words (date's +FORMAT). */
+  check?: (words: readonly string[]) => boolean;
+}
+
+const COLOR = ["--color", "--color=", "--colour", "--colour=", "--no-color"];
+const SED_LINE = String.raw`(?:\d+|\$)(?:,(?:\d+|\$))?p`;
+const SED_PRINT = new RegExp(`^${SED_LINE}(?:;${SED_LINE})*$`);
+const CHECKSUM: Spec = { short: "btz", long: ["--binary", "--text", "--tag", "--zero"] };
+
+/** Programs that only read, and the options each may have. */
+const READERS: Record<string, Spec> = {
+  ls: { short: "aAlhRtrSd1FGiknopsuUcmxCbBgqQvX", long: ["--all", "--almost-all", ...COLOR, "--human-readable", "--classify", "--group-directories-first",
+    "--sort=", "--time-style=", "--reverse", "--recursive", "--directory", "--size", "--inode", "--full-time", "--format=", "--literal", "--quoting-style="],
+    recursive: (options) => options.has("-R") || options.has("--recursive") },
+  pwd: { short: "LP", words: "none" },
+  cat: { short: "nbsAvETet", long: ["--number", "--number-nonblank", "--squeeze-blank", "--show-all", "--show-ends", "--show-tabs", "--show-nonprinting"] },
+  head: { short: "qvz", value: "nc", number: true, long: ["--quiet", "--silent", "--verbose", "--zero-terminated", "--lines=", "--bytes="] },
+  tail: { short: "qvzr", value: "nc", number: true, long: ["--quiet", "--silent", "--verbose", "--zero-terminated", "--lines=", "--bytes="] },
+  wc: { short: "lcmwL", long: ["--lines", "--words", "--chars", "--bytes", "--max-line-length"] },
+  nl: { short: "p", value: "bnwsvidhfl" },
+  grep: grepSpec(), egrep: grepSpec(), fgrep: grepSpec(),
+  rg: {
+    short: "nilwvcFxSsuUHIoqNa0pP.", value: "efgtTABCmMdjr",
+    long: ["--hidden", "--no-ignore", "--no-ignore-vcs", "--no-ignore-parent", "--files", "--count", "--count-matches", "--json", "--line-number",
+      "--no-line-number", "--ignore-case", "--smart-case", "--case-sensitive", "--fixed-strings", "--word-regexp", "--line-regexp",
+      "--files-with-matches", "--files-without-match", "--no-heading", "--heading", "--vimgrep", "--only-matching", "--stats", "--invert-match",
+      "--multiline", "--no-messages", "--null", "--trim", "--column", "--no-filename", "--with-filename", "--unrestricted", "--pcre2", "--crlf",
+      "--text", "--quiet", "--type-list", "--sort=", "--sortr=", "--glob=", "--iglob=", "--type=", "--type-not=", "--max-count=", "--context=",
+      "--after-context=", "--before-context=", "--max-depth=", "--max-columns=", "--max-filesize=", "--regexp=", "--file=", "--threads=",
+      "--replace=", "--encoding=", ...COLOR],
+    pattern: ["-e", "-f", "--regexp", "--file", "--files", "--type-list"], pathOptions: ["-f", "--file"], recursive: true, contents: true,
+  },
+  command: { short: "vV", words: "text" },
+  type: { short: "afptPT", words: "text" },
+  ps: { anyOption: true, words: "text" },
+  which: { short: "as", words: "text" }, whereis: { short: "bmsu", words: "text" },
+  file: { short: "bikNnhL", long: ["--mime", "--mime-type", "--mime-encoding", "--brief"] },
+  stat: { short: "Lltx", long: ["--dereference", "--terse", "--format=", "--printf="] },
+  du: { short: "shacdkmxbHl", value: "d", long: ["--max-depth=", "--summarize", "--human-readable", "--apparent-size", "--all", "--total"], recursive: true },
+  df: { short: "hHkiTPla", long: ["--human-readable", "--inodes", "--total", "--print-type"] },
+  tree: { short: "adfiFpsughDCnJQN", value: "LIP", long: ["--gitignore", "--dirsfirst", "--noreport", "--du", "--charset="], recursive: true },
+  echo: { anyOption: true, words: "text" },
+  // printf -v NAME assigns a shell variable (PATH, IFS, BASH_ENV...) that the next command then uses: no options at all.
+  // The format's %n assigns the count of printed characters to the variable named by the next word (bash), so it asks too.
+  printf: { words: "text", check: (words) => !/%[^a-zA-Z\\]*[hlLqjzt]*n/.test(words[0] ?? "") },
+  basename: { short: "az", value: "s", words: "text" }, dirname: { short: "z", words: "text" },
+  realpath: { short: "eqsmLPz", long: ["--relative-to=", "--relative-base="], pathOptions: ["--relative-to", "--relative-base"] },
+  readlink: { short: "fenmqsvz" },
+  uname: { short: "asnrvmpio", long: ["--all", "--kernel-name", "--nodename", "--kernel-release", "--kernel-version", "--machine", "--processor", "--hardware-platform", "--operating-system"], words: "none" },
+  whoami: { words: "none" }, id: { short: "unGgrz", words: "text" },
+  date: { short: "uR", value: "dr", optional: "I", long: ["--utc", "--iso-8601", "--iso-8601=", "--rfc-3339=", "--rfc-email", "--date="],
+    pathOptions: ["-r"], words: "text", check: (words) => words.every((word) => word.startsWith("+")) },
+  hostname: { short: "sfidaIA", words: "none" },
+  true: { anyOption: true, words: "text" }, false: { anyOption: true, words: "text" },
+  // It only waits: a number of seconds (or 2m, 1.5h), no options.
+  sleep: { words: "text", check: (words) => words.length > 0 && words.every((word) => /^\d+(?:\.\d+)?[smhd]?$/.test(word)) },
+  sort: { short: "bdfgiMhnRrsuVcCz", value: "ktS", long: ["--numeric-sort", "--reverse", "--unique", "--human-numeric-sort", "--version-sort",
+    "--ignore-case", "--general-numeric-sort", "--month-sort", "--stable", "--check", "--ignore-leading-blanks", "--dictionary-order",
+    "--zero-terminated", "--key=", "--field-separator=", "--buffer-size=", "--parallel="] },
+  cut: { short: "snz", value: "dfcb", long: ["--complement", "--only-delimited", "--zero-terminated", "--delimiter=", "--fields=", "--characters=",
+    "--bytes=", "--output-delimiter="] },
+  tr: { short: "cdsCt", words: "text" },
+  // Files only (regularFiles): given a folder, diff compares the files inside it, and a link in there can lead out of the project.
+  diff: { regularFiles: true, short: "uqawbBiEtTypcs", value: "UCIW", long: ["--unified", "--unified=", "--brief", ...COLOR, "--side-by-side", "--ignore-space-change",
+    "--ignore-all-space", "--ignore-blank-lines", "--ignore-case", "--text", "--strip-trailing-cr", "--label=",
+    "--report-identical-files", "--expand-tabs", "--ignore-matching-lines=", "--context", "--context=", "--suppress-common-lines", "--width=",
+    "--minimal", "--normal"] },
+  cmp: { short: "bls", value: "ni" },
+  comm: { short: "123z", long: ["--check-order", "--nocheck-order", "--total", "--output-delimiter="] },
+  md5sum: CHECKSUM, sha1sum: CHECKSUM, sha256sum: CHECKSUM, sha512sum: CHECKSUM, shasum: { ...CHECKSUM, value: "a" },
+  // Print-only scripts (sed -n '200,280p' file, '5p', '10,$p;20p'): no w, e, r or s command, so it only prints. No -i or -f.
+  sed: { short: "nEr", long: ["--quiet", "--silent", "--regexp-extended"], pattern: [], check: (words) => SED_PRINT.test(words[0] ?? "") },
+  // `uniq in out` writes its second file.
+  uniq: { short: "cdDuiz", value: "fsw", long: ["--count", "--repeated", "--unique", "--ignore-case", "--skip-fields=", "--skip-chars=",
+    "--check-chars="], maxWords: 1 },
+};
+
+function grepSpec(): Spec {
+  // No -R or -d/-D: -R follows links inside folders, which can lead out of the project.
+  return {
+    short: "nirlLcwvEFPhHoqsIxzZTabUy", value: "efABCm",
+    long: ["--line-number", "--ignore-case", "--recursive", "--files-with-matches", "--files-without-match", "--count", "--word-regexp",
+      "--line-regexp", "--invert-match", "--extended-regexp", "--fixed-strings", "--perl-regexp", "--basic-regexp", "--no-filename",
+      "--with-filename", "--only-matching", "--quiet", "--silent", "--no-messages", "--binary-files=", "--null", "--text", "--label=", "--include=",
+      "--exclude=", "--exclude-dir=", "--max-count=", "--context=", "--after-context=", "--before-context=", "--regexp=", "--file=", ...COLOR],
+    pattern: ["-e", "-f", "--regexp", "--file"], pathOptions: ["-f", "--file"],
+    recursive: (options) => options.has("-r") || options.has("--recursive"), contents: true,
+  };
+}
+
+const DIFF_LONG = ["--stat", "--stat=", "--shortstat", "--numstat", "--name-only", "--name-status", "--summary", "--patch", "--no-patch", "--raw",
+  "--cached", "--staged", "--word-diff", "--word-diff=", "--color-words", "--ignore-all-space", "--ignore-space-change", "--ignore-blank-lines",
+  "--minimal", "--patience", "--histogram", "--diff-algorithm=", "--no-renames", "--find-renames", "--find-copies", "--check", "--exit-code",
+  "--quiet", "--no-ext-diff", "--no-textconv", "--full-index", "--abbrev", "--abbrev=", "--relative", "--merge-base", "--compact-summary",
+  "--dirstat", "--unified", "--unified=", "--diff-filter=", "--ignore-submodules", ...COLOR];
+const LOG_LONG = ["--oneline", "--graph", "--all", "--decorate", "--decorate=", "--no-decorate", "--reverse", "--first-parent", "--merges",
+  "--no-merges", "--abbrev-commit", "--follow", "--topo-order", "--date-order", "--left-right", "--cherry-pick", "--boundary", "--full-history",
+  "--source", "--branches", "--tags", "--remotes", "--no-walk", "--walk-reflogs", "--format=", "--pretty", "--pretty=", "--date=", "--author=",
+  "--committer=", "--since=", "--until=", "--after=", "--before=", "--grep=", "--max-count=", "--skip=", "--all-match", "--invert-grep",
+  "--regexp-ignore-case", "--simplify-by-decoration"];
+
+/** git subcommands that only read, and their options. No -c, -C, --output, --ext-diff, --textconv, -O or --no-index:
+ * those set a program to run, write a file or read outside the project. -U, --unified and --abbrev take a value only
+ * when it is joined (-U5, --abbrev=7), as git reads them: the word after them is a file and is checked. */
+const GIT_READERS: Record<string, Spec> = {
+  status: { pathspec: true, short: "sbvz", optional: "u", long: ["--short", "--branch", "--porcelain", "--porcelain=", "--long", "--show-stash", "--ahead-behind",
+    "--no-ahead-behind", "--renames", "--no-renames", "--untracked-files", "--untracked-files=", "--ignored", "--verbose"] },
+  diff: { pathspec: true, short: "pusbwRMz", optional: "U", long: DIFF_LONG },
+  log: { pathspec: true, short: "psuwgiEFPMz", value: "nSG", optional: "U", number: true, long: [...DIFF_LONG, ...LOG_LONG] },
+  show: { pathspec: true, short: "psuwMz", value: "n", optional: "U", number: true, long: [...DIFF_LONG, ...LOG_LONG] },
+  "rev-parse": { short: "q", long: ["--show-toplevel", "--abbrev-ref", "--abbrev-ref=", "--short", "--short=", "--git-dir", "--is-inside-work-tree",
+    "--is-inside-git-dir", "--verify", "--symbolic-full-name", "--show-prefix", "--show-cdup", "--quiet", "--absolute-git-dir", "--git-common-dir",
+    "--is-bare-repository"] },
+  // No --stdin/--exclude-existing, --output or alternate-ref programs: literal revisions/refs and read options only.
+  "rev-list": { short: "qz", value: "n", number: true, long: ["--count", "--left-right", "--left-only", "--right-only", "--cherry-pick", "--cherry-mark",
+    "--all", "--branches", "--branches=", "--tags", "--tags=", "--remotes", "--remotes=", "--not", "--first-parent", "--merges", "--no-merges",
+    "--min-parents=", "--max-parents=", "--no-min-parents", "--no-max-parents", "--max-count=", "--skip=", "--since=", "--until=", "--after=", "--before=",
+    "--author=", "--committer=", "--grep=", "--all-match", "--invert-grep", "--regexp-ignore-case", "--topo-order", "--date-order", "--reverse",
+    "--boundary", "--ancestry-path", "--full-history", "--simplify-merges", "--no-walk", "--no-walk=", "--do-walk", "--timestamp", "--parents",
+    "--children", "--pretty", "--pretty=", "--format=", "--abbrev-commit", "--no-abbrev-commit", "--abbrev", "--abbrev=", "--oneline", "--header", "--quiet"] },
+  "show-ref": { short: "qsvd", long: ["--heads", "--branches", "--tags", "--head", "--dereference", "--hash", "--hash=", "--abbrev", "--abbrev=",
+    "--verify", "--quiet", "--exists"], words: "text" },
+  "for-each-ref": { long: ["--count=", "--sort=", "--format=", "--points-at=", "--merged", "--merged=", "--no-merged", "--no-merged=",
+    "--contains", "--contains=", "--no-contains", "--no-contains=", "--ignore-case", "--omit-empty", "--include-root-refs", "--shell", "--perl",
+    "--python", "--tcl", "--color", "--color="], words: "text" },
+  "ls-files": { short: "cdmoisuktvzf", long: ["--cached", "--deleted", "--modified", "--others", "--ignored", "--stage", "--unmerged",
+    "--exclude-standard", "--full-name", "--error-unmatch", "--directory", "--no-empty-directory", "--eol", "--deduplicate"] },
+  blame: { pathspec: true, short: "wMCesltfnpb", value: "L", long: ["--porcelain", "--line-porcelain", "--show-email", "--show-name", "--show-number", "--root",
+    "--abbrev", "--abbrev=", "--date="] },
+  describe: { long: ["--tags", "--always", "--long", "--all", "--dirty", "--dirty=", "--exact-match", "--first-parent", "--abbrev", "--abbrev=", "--match=",
+    "--exclude=", "--candidates="] },
+  shortlog: { short: "sne", long: ["--summary", "--numbered", "--email", "--no-merges", "--all", "--format=", "--since=", "--until=", "--author=",
+    "--group="] },
+  // No --cached: it searches the index, which can hold a private file that is deleted from the work tree (the whole-folder rule only sees the work tree).
+  grep: { pathspec: true, short: "nilLcwvEFPhHIqopWz", value: "efABCm", long: ["--line-number", "--ignore-case", "--files-with-matches", "--files-without-match",
+    "--count", "--word-regexp", "--invert-match", "--extended-regexp", "--fixed-strings", "--perl-regexp", "--basic-regexp",
+    "--untracked", "--full-name", "--heading", "--break", "--only-matching", "--show-function", "--function-context", "--all-match", "--and",
+    "--or", "--not", "--column", "--null", "--quiet", "--recurse-submodules", "--exclude-standard", "--max-depth=", "--context=",
+    "--after-context=", "--before-context=", "--max-count=", "--threads=", ...COLOR],
+    pattern: ["-e", "-f"], pathOptions: ["-f"], recursive: true, contents: true },
+  branch: { short: "arvl", long: ["--all", "--remotes", "--list", "--show-current", "--verbose", "--contains=", "--no-contains=", "--merged=",
+    "--no-merged=", "--points-at=", "--sort=", "--format=", ...COLOR], wordsOnlyWith: ["-l", "--list"] },
+  tag: { short: "l", optional: "n", long: ["--list", "--sort=", "--contains=", "--no-contains=", "--points-at=", "--merged=", "--no-merged=",
+    "--format="], wordsOnlyWith: ["-l", "--list"] },
+  remote: { short: "v", long: ["--verbose"], words: "none" },
+  "merge-base": { short: "a", long: ["--all", "--is-ancestor", "--octopus", "--independent", "--fork-point"] },
+  "ls-tree": { short: "rdtlz", long: ["--name-only", "--name-status", "--full-name", "--full-tree", "--abbrev", "--long"] },
+  "cat-file": { short: "ptse" },
+};
+
+/** Files a read must not print to the AI, project or not: keys, logins, .env files and secrets files. Not *.ini,
+ * *.properties or a plain *.pem (CA bundles): most repos have those, and every search of the project would ask. */
+const PRIVATE_NAME = /(?:^|\/)(?:\.env(?:\..*)?|[^/]*\.env|\.envrc|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|\.netrc|_netrc|\.npmrc|\.pypirc|\.pgpass|\.dockercfg|\.git-credentials|[^/]*credentials(?:\.\w+)?|\.?secrets?\.(?:ya?ml|json|toml|env|txt)|[^/]*\.(?:key|p12|pfx|ppk|tfvars|tfstate(?:\.backup)?|ovpn)|[^/]*key[^/]*\.pem)$/i;
+
+/** `cwd`: the folder the command runs in (the project, or a folder in it a `cd` on the line moved to). `home` and
+ * `realHome`: set when reads in your own folders count (ReadPlace.homeReads). */
+interface Place { root: string; realRoot: string; private: string[]; cwd: string; home?: string; realHome?: string; remote?: boolean }
+
+/** Folders under home that hold apps' data, not your own files: a read there still asks. */
+const APP_DATA = new Set(["library", "appdata", "application data"]);
+
+/** True when `absolute` (and `real`, where its links lead) is in one of your own folders under home: below home, its
+ * first folder neither hidden (.ssh, .config) nor app data (Library, AppData). */
+function inOwnFolders(place: Place, absolute: string, real: string): boolean {
+  if (!place.home || !place.realHome) return false;
+  const own = (base: string, name: string) => {
+    const relative = path.relative(base, name);
+    if (!relative || isOutside(relative)) return false;
+    const first = relative.split(path.sep)[0]!;
+    return !first.startsWith(".") && !APP_DATA.has(first.toLowerCase());
+  };
+  return own(place.home, absolute) && own(place.realHome, real);
+}
+
+/** Where a read may be: the project, or (homeReads) your own folders. */
+function inReadArea(place: Place, absolute: string, real: string): boolean {
+  return (within(place.root, absolute) && within(place.realRoot, real)) || inOwnFolders(place, absolute, real);
+}
+
+function placeOf(where: ReadPlace | string | undefined): Place {
+  const given = typeof where === "string" ? { root: where } : where;
+  const root = path.resolve(given?.root ?? process.cwd());
+  const home = given?.home ?? os.homedir();
+  // ~/.casper as a whole: its settings, logins and remembered answers are not for a read that runs without asking.
+  // Crew copies live here, not among Casper's settings. Keep the real private list and explicit denyRead intact.
+  const crewCopies = path.join(home, ".casper", "worktrees");
+  const inCrewCopy = within(crewCopies, root) && root !== crewCopies && within(realpathLongest(crewCopies), realpathLongest(root));
+  const deny = [...(given?.denyRead ?? []), ...(inCrewCopy ? [] : [path.join(home, ".casper")])];
+  const places = privatePlaces({ root, home, denyRead: deny }).flatMap((place) => place.paths);
+  return { root, realRoot: realpathLongest(root), private: [...new Set(places)], cwd: root,
+    ...(given && typeof given === "object" && given.homeReads ? { home: path.resolve(home), realHome: realpathLongest(path.resolve(home)) } : {}) };
+}
+
+/** A ".." is only plain text when nothing before it can be a link: leading ../ steps (with a root that is not itself
+ * reached through a link) are fine; a ".." after a name is not, since the kernel follows the link first (sshl/.. is
+ * not the project). */
+function plainDots(word: string, place: Place): boolean {
+  const parts = word.split("/");
+  let index = 0;
+  while (index < parts.length && (parts[index] === ".." || parts[index] === "." || parts[index] === "")) index++;
+  if (parts.slice(index).includes("..")) return false;
+  return !parts.includes("..") || place.root === place.realRoot;
+}
+
+/** On NTFS, `.env::$DATA` (a data stream) and `.env `, `.env.` (a trailing space or dot is dropped) open the same file as `.env`.
+ * A file operand with a colon (but a drive letter and a slash, C:/x) or a name ending in a space or a dot (not . or ..) asks,
+ * on every OS: cheap and fails closed. Pattern arguments are never checked here. */
+function plainWindowsName(word: string): boolean {
+  const parts = word.split("/");
+  return parts.every((part, at) => {
+    if (part.includes(":") && !(at === 0 && parts.length > 1 && /^[A-Za-z]:$/.test(part))) return false;
+    return part === "." || part === ".." || !(part.endsWith(" ") || part.endsWith("."));
+  });
+}
+
+/** Where a path word leads from the folder the command runs in. On Windows the shell is Git Bash: /c/Users is C:\Users, and
+ * any other / path (/tmp, /etc, //host) is a folder of Git's own or a share, so it is undefined (the command asks). */
+function resolveWord(word: string, place: Place, windows = process.platform === "win32"): string | undefined {
+  if (!windows || !word.startsWith("/")) return path.resolve(place.cwd, word);
+  const drive = windowsShellPath(word);
+  return drive === word || /^\/(?:mnt|cygdrive|proc)\//i.test(word) ? undefined : path.resolve(drive);
+}
+
+/** A file word is fine when it, and where its links lead, is in the project and not private. `folder`: the command
+ * reads all of it, so a private place inside counts too. */
+function fileOk(word: string, place: Place, folder: boolean, contents = false, windowsNames = true): boolean {
+  // On another machine (remoteReadOnly) the files are there, not here: reading them changes nothing.
+  if (word === "-" || place.remote) return true;
+  // A backslash is a separator on Windows (Git Bash): a path word with one can't be checked by its text.
+  if (word.includes("\\") || !plainDots(word, place)) return false;
+  if (windowsNames && !plainWindowsName(word)) return false;
+  const absolute = resolveWord(word, place);
+  if (absolute === undefined) return false;
+  const real = realpathLongest(absolute);
+  if (!inReadArea(place, absolute, real)) return false;
+  for (const candidate of [absolute, real]) {
+    if (PRIVATE_NAME.test(candidate.split(path.sep).join("/"))) return false;
+    if (place.private.some((entry) => within(entry, candidate) || (folder && within(candidate, entry)))) return false;
+  }
+  return !(folder && contents && holdsPrivateFile(real));
+}
+
+/** Folders skipped when looking for a private file inside: git's own data, and installed packages. */
+const SKIP_FOLDERS = new Set([".git", "node_modules"]);
+/** More entries than this and the folder counts as holding one: asking costs less than walking a huge tree. An object
+ * so a test can check the rule with a small budget: 20,001 real folders take minutes on a Windows runner. */
+export const ENTRY_BUDGET = { max: 20_000 };
+
+/** True when a .env, key or login file is somewhere inside `folder` (links are not followed, as grep -r and rg don't). */
+function holdsPrivateFile(folder: string): boolean {
+  let seen = 0;
+  const stack = [folder];
+  while (stack.length) {
+    const current = stack.pop()!;
+    let names: string[];
+    try {
+      if (!lstatSync(current).isDirectory()) return PRIVATE_NAME.test(current.split(path.sep).join("/"));
+      names = readdirSync(current);
+    } catch { continue; }
+    for (const name of names) {
+      if (++seen > ENTRY_BUDGET.max) return true;
+      const full = path.join(current, name);
+      if (PRIVATE_NAME.test(full.split(path.sep).join("/"))) return true;
+      if (SKIP_FOLDERS.has(name)) continue;
+      try { if (lstatSync(full).isDirectory()) stack.push(full); } catch { /* gone or unreadable */ }
+    }
+  }
+  return false;
+}
+
+/** More files than this from one * or ? and the command asks: checking each costs more than a question. */
+const MAX_MATCHES = 1000;
+
+/** The files bash puts in place of a word with an unquoted * or ? (and no quote in it), as bash writes them; the word itself
+ * when nothing matches (bash keeps it then). Undefined (ask) for a part that starts with a dot (.* can pick ..), or too many.
+ * Names are matched ignoring case and never start with a dot, so the list holds every name bash picks, and maybe more. */
+function expandGlob(word: string, place: Place): string[] | undefined {
+  if (place.remote) return [word];
+  let found = [""];
+  const parts = word.split("/");
+  for (const [at, part] of parts.entries()) {
+    const join = (prefix: string, name: string) => at === 0 ? name : `${prefix}/${name}`;
+    if (!/[*?]/.test(part)) { found = found.map((prefix) => join(prefix, part)); continue; }
+    if (part.startsWith(".")) return undefined;
+    const pattern = new RegExp(`^${part.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "is");
+    const next: string[] = [];
+    for (const prefix of found) {
+      const folder = resolveWord(at === 0 ? "." : prefix || "/", place);
+      if (folder === undefined) return undefined;
+      let names: string[];
+      try { names = readdirSync(folder); } catch { continue; }
+      for (const name of names) if (!name.startsWith(".") && pattern.test(name)) next.push(join(prefix, name));
+      if (next.length > MAX_MATCHES) return undefined;
+    }
+    found = next;
+  }
+  const there = found.filter((match) => { try { lstatSync(resolveWord(match, place) ?? ""); return true; } catch { return false; } });
+  return there.length ? there.sort() : [word];
+}
+
+/** Checks one program's words against its spec. `git`: a word with a colon in it (rev:path, :path, ::path, :(magic), a colon inside braces) asks.
+ * `globs`: the args with an unquoted * or ?, put in place by the files they pick; each must be a file word (never an option,
+ * an option's value or a search pattern). `stdin`: it may read only what is piped in, no file at all (`| tail -25`). */
+function allowed(spec: Spec, args: readonly string[], place: Place, git = false, globs: ReadonlySet<number> = new Set(), stdin = false): boolean {
+  const options = new Set<string>();
+  const words: string[] = [];
+  const files: string[] = [];
+  let dashAt = Infinity;
+  const longs = spec.long ?? [];
+  let index = 0;
+  let firstFromGlob = false;
+  const pushWord = (at: number): boolean => {
+    if (!globs.has(at)) { words.push(args[at]!); return true; }
+    const found = expandGlob(args[at]!, place);
+    if (!found || found.some((word) => word.startsWith("-"))) return false;
+    if (!words.length) firstFromGlob = true;
+    words.push(...found);
+    return true;
+  };
+  // A value given as the next word is never an option: `git diff -U --no-index` would hide --no-index from this
+  // check while git reads it. A number (head -n -5, tail -n +5) is fine.
+  const takeValue = (name: string, joined: string | undefined): boolean => {
+    let value = joined;
+    if (value === undefined) {
+      value = args[++index];
+      if (value === undefined) return true;
+      if (globs.has(index)) return false;
+      if (value.startsWith("-") && !/^[-+]\d+$/.test(value)) return false;
+    }
+    if (spec.pathOptions?.includes(name)) files.push(value);
+    return true;
+  };
+  for (; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--") {
+      dashAt = words.length;
+      for (let at = index + 1; at < args.length; at++) if (!pushWord(at)) return false;
+      break;
+    }
+    if (globs.has(index) && arg.startsWith("-")) return false;
+    if (!arg.startsWith("-") || arg === "-") { if (!pushWord(index)) return false; continue; }
+    if (spec.anyOption) continue;
+    if (spec.number && /^-\d+$/.test(arg)) continue;
+    if (arg.startsWith("--")) {
+      const equals = arg.indexOf("=");
+      const name = equals < 0 ? arg : arg.slice(0, equals);
+      options.add(name);
+      if (equals >= 0) {
+        if (!longs.includes(`${name}=`)) return false;
+        takeValue(name, arg.slice(equals + 1));
+      } else if (longs.includes(name)) continue;
+      else if (longs.includes(`${name}=`)) { if (!takeValue(name, undefined)) return false; }
+      else return false;
+      continue;
+    }
+    const letters = arg.slice(1);
+    for (let at = 0; at < letters.length; at++) {
+      const letter = letters[at]!;
+      const name = `-${letter}`;
+      options.add(name);
+      if (spec.short?.includes(letter)) continue;
+      const rest = letters.slice(at + 1);
+      if (spec.value?.includes(letter)) { if (!takeValue(name, rest || undefined)) return false; break; }
+      if (spec.optional?.includes(letter)) break;
+      return false;
+    }
+  }
+  if (spec.wordsOnlyWith && words.length && !spec.wordsOnlyWith.some((option) => options.has(option))) return false;
+  if (spec.check && !spec.check(words)) return false;
+  const kind = spec.words ?? "paths";
+  if (kind === "none") return words.length === 0;
+  if (spec.maxWords !== undefined && words.length > spec.maxWords) return false;
+  if (stdin ? files.length > 0 : !files.every((file) => fileOk(file, place, false))) return false;
+  if (kind === "text") return true;
+  const skip = spec.pattern && !spec.pattern.some((option) => options.has(option)) ? 1 : 0;
+  // `grep foo* x`: bash's first file would be the pattern, and the rest files the check can't line up.
+  if (skip && firstFromGlob) return false;
+  const given = words.slice(skip);
+  // git reads rev:path, :path (short magic), ::path and :(magic) from any word, before or after `--`, so any git word that
+  // is not an option and has a colon in it asks. Option values (--grep=a:b, -S a:b, -e a:b) are not words.
+  if (git && given.some((word) => word.includes(":"))) return false;
+  // After `--` every word is a pathspec; before it a word may also be a revision.
+  const afterDash = (at: number) => at + skip >= dashAt;
+  // git expands * ? [ in a pathspec itself (git grep -- '.en*' prints .env): the text check can't follow that.
+  if (git && spec.pathspec && given.some((word) => /[*?[]/.test(word))) return false;
+  const paths = given;
+  const recursive = typeof spec.recursive === "function" ? spec.recursive(options) : Boolean(spec.recursive);
+  if (spec.regularFiles && !place.remote && !paths.every((word) => word === "-" || isRegularFile(resolveWord(word, place) ?? ""))) return false;
+  const list = paths.length ? [...paths] : recursive ? ["."] : [];
+  if (stdin) return list.length === 0;
+  // git grep REV with no path in the project and none after `--` searches that revision's whole tree (HEAD:.env): the
+  // whole-folder rule applies, as it does for `git grep X` with no word at all.
+  if (git && spec.contents && paths.length && given.some((word, at) => !afterDash(at) && !existsInProject(word, place))
+    && !given.some((word, at) => afterDash(at) || existsInProject(word, place))) list.push(".");
+  return list.every((word) => fileOk(word, place, recursive, Boolean(spec.contents), !git));
+}
+
+/** True when the word names something that is there in the project (links not followed): then it is a path, not a revision. */
+function existsInProject(word: string, place: Place): boolean {
+  if (place.remote) return false;
+  const absolute = resolveWord(word, place);
+  if (absolute === undefined) return false;
+  try { lstatSync(absolute); return true; } catch { return false; }
+}
+
+/** True when the path (links followed) is a regular file, or is not there at all (the program only reports that). */
+function isRegularFile(file: string): boolean {
+  try { return statSync(file).isFile(); } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+}
+
+/** find: start folders, then tests and -print only. No -exec, -ok, -delete, -fprint, -L or -follow. */
+const FIND_TESTS = new Set(["-print", "-print0", "-empty", "-prune", "-depth", "-not", "-o", "-a", "-or", "-and", "-true", "-false", "-readable",
+  "-writable", "-executable", "-nouser", "-nogroup", "-xdev", "-mount", "-daystart", "-noleaf", "-quit", "-ls", "(", ")", "!", ","]);
+const FIND_VALUE = new Set(["-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-type", "-xtype", "-maxdepth",
+  "-mindepth", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-perm", "-user", "-group", "-uid", "-gid", "-links", "-inum",
+  "-regextype", "-printf"]);
+const FIND_FILE = new Set(["-samefile", "-newer", "-anewer", "-cnewer"]);
+
+function findAllowed(args: readonly string[], place: Place): boolean {
+  let index = 0;
+  while (args[index] === "-P") index++;
+  const starts: string[] = [];
+  for (; index < args.length && !/^[-()!,]/.test(args[index]!); index++) starts.push(args[index]!);
+  for (; index < args.length; index++) {
+    const arg = args[index]!;
+    if (FIND_TESTS.has(arg)) continue;
+    if (FIND_VALUE.has(arg)) { index++; continue; }
+    if (FIND_FILE.has(arg)) { const file = args[++index]; if (file !== undefined && !fileOk(file, place, false)) return false; continue; }
+    return false;
+  }
+  return (starts.length ? starts : ["."]).every((word) => fileOk(word, place, true));
+}
+
+/** Version-only invocations are reads; arguments that run code or name files still ask. */
+
+/** `python --version`, `node --version`: the program prints its version. */
+function versionOnly(words: readonly string[]): boolean {
+  return words.length === 2 && (["--version", "-V"].includes(words[1]!) || words[0] === "java" && words[1] === "-version");
+}
+
+/** `globs`: the words (by place) with an unquoted * or ?. `stdin`: it may read only what is piped in (see allowed). */
+function readerSegment(words: string[], place: Place, globs: ReadonlySet<number> = new Set(), stdin = false): boolean {
+  const [name, ...args] = words;
+  if (!name || globs.has(0) || name.includes("=") || name.includes("/") || name.includes("\\")) return false;
+  // A word starting with ~ (even a quoted one: the text check would read it as a folder named ~). A $ can only be here
+  // from inside single quotes (safeLine refuses every other one), where it is plain text.
+  if (words.some((word) => word.startsWith("~"))) return false;
+  if (versionOnly(words)) return true;
+  if (place.remote) {
+    // `sudo -n docker ps` there: the command sudo runs.
+    if (name === "sudo") {
+      let at = 0;
+      while (at < args.length && args[at]!.startsWith("-")) at += /^-[ugChDpUrtT]$/.test(args[at]!) ? 2 : 1;
+      return at < args.length && readerSegment(args.slice(at), place, new Set([...globs].map((index) => index - at - 1)), stdin);
+    }
+    const server = Object.hasOwn(SERVER_READS, name) ? SERVER_READS[name] : undefined;
+    if (server) return server(args);
+    if (name === "tail" && args.some((arg) => /^-[A-Za-z]*[fF]/.test(arg) || arg === "--follow")) {
+      return readerSegment([name, ...args.filter((arg) => !/^(?:-[fF]|--follow)$/.test(arg))], place, new Set(), stdin);
+    }
+  }
+  if (name === "timeout") {
+    const inner = globs.size ? undefined : timeoutCommand(args);
+    return inner !== undefined && readerSegment(inner, place, new Set(), stdin);
+  }
+  if (name === "test") return !stdin && globs.size === 0 && args.length === 2 && ["-d", "-f", "-e"].includes(args[0]!) && fileOk(args[1]!, place, false);
+  if (name === "ps" && (globs.size || !psReads(args))) return false;
+  // `command` without -v/-V executes its operand; only lookup is a read.
+  if (name === "command" && (args.length < 2 || !["-v", "-V"].includes(args[0]!))) return false;
+  if (stdin && (name === "find" || name === "git" || globs.size)) return false;
+  // find's start folders and git's pathspecs: the program reads * and ? itself, and expands them its own way.
+  if ((name === "find" || name === "git") && globs.size) return false;
+  if (name === "find") return findAllowed(args, place);
+  if (name === "git") {
+    // git descends into submodules and runs their own config (core.fsmonitor): not a plain read there.
+    if (!place.remote && hasSubmodules(place.cwd)) return false;
+    let index = 0;
+    while (args[index] === "--no-pager" || args[index] === "-P") index++;
+    const sub = args[index];
+    if (sub === "config") return configReads(args.slice(index + 1));
+    const spec = sub === undefined ? undefined : Object.hasOwn(GIT_READERS, sub) ? GIT_READERS[sub] : undefined;
+    return Boolean(spec) && allowed(spec!, args.slice(index + 1), place, true);
+  }
+  const spec = Object.hasOwn(READERS, name) ? READERS[name] : undefined;
+  return Boolean(spec) && allowed(spec!, args, place, false, new Set([...globs].map((at) => at - 1)), stdin);
+}
+
+/** `timeout [-s SIG] [-k DUR] [--preserve-status] [--foreground] DURATION command...`: the command it runs, which is what
+ * the line does (timeout only stops it after a while), or undefined when the words are anything else. */
+export function timeoutCommand(args: readonly string[]): string[] | undefined {
+  let at = 0;
+  const duration = /^\d+(?:\.\d+)?[smhd]?$/;
+  while (at < args.length && args[at]!.startsWith("-")) {
+    const arg = args[at]!;
+    if (arg === "--preserve-status" || arg === "--foreground" || arg === "-v" || arg === "--verbose") at++;
+    else if (arg === "-s" || arg === "-k") { if (!/^[A-Za-z0-9.]+$/.test(args[at + 1] ?? "")) return undefined; at += 2; }
+    else if (/^--(?:signal|kill-after)=[A-Za-z0-9.]+$/.test(arg)) at++;
+    else return undefined;
+  }
+  if (!duration.test(args[at] ?? "")) return undefined;
+  const inner = args.slice(at + 1);
+  return inner.length && inner[0] !== "timeout" ? [...inner] : undefined;
+}
+
+/** Process environments hold credentials. Keep Linux -e, but never BSD e or macOS E environment output. */
+function psReads(args: readonly string[]): boolean {
+  for (let at = 0; at < args.length; at++) {
+    const arg = args[at]!;
+    // Formats/sort fields are data, not BSD flag groups, whether joined or separated.
+    let takesFormat = false;
+    if (arg.startsWith("--")) {
+      const [name] = arg.split("=");
+      if (name!.includes("E")) return false;
+      takesFormat = (name === "--format" || name === "--sort") && !arg.includes("=");
+    } else {
+      const group = arg.replace(/^-/, "");
+      const formatAt = group.search(/[oO]/);
+      const flags = formatAt < 0 ? group : group.slice(0, formatAt);
+      if (flags.includes("E") || (!arg.startsWith("-") && flags.includes("e"))) return false;
+      takesFormat = formatAt >= 0 && formatAt === group.length - 1;
+    }
+    if (takesFormat) {
+      const value = args[++at];
+      if (!value || value.startsWith("-")) return false;
+    }
+  }
+  return true;
+}
+
+/** Git config's old implicit read syntax becomes a write with a second operand. Never accept mutation flags or files. */
+function configReads(args: readonly string[]): boolean {
+  const flags = new Set(["--global", "--local", "--system", "--worktree", "--show-origin", "--show-scope", "--includes", "--no-includes"]);
+  let action: string | undefined;
+  const keys: string[] = [];
+  for (const arg of args) {
+    if (flags.has(arg)) continue;
+    if (["--get", "--get-all"].includes(arg)) {
+      if (action) return false;
+      action = arg;
+    } else if (arg.startsWith("-")) return false;
+    else keys.push(arg);
+  }
+  return keys.length === 1 && /^[A-Za-z][A-Za-z0-9-]*\.[^\s]+$/.test(keys[0]!)
+    && !/credential|token|password|extraheader/i.test(keys[0]!)
+    && !/^url\..+\.(?:push)?insteadof$/i.test(keys[0]!);
+}
+
+/** Outside quotes only these characters may appear: letters, digits, space, tab, the punctuation of paths, options and
+ * the allowed operators, and * and ? (expanded here, see expandGlob). Anything else (a backslash, $, backtick, !, ( ) { } [ ],
+ * a control or non-ASCII character) means the line is not read by this check. < and > are kept here only so a later check
+ * can see and refuse them. */
+const SAFE_BARE = /^[A-Za-z0-9 \t._\-/:=@%+,|&;^~#<>*?]$/;
+/** Inside double quotes the same, plus the characters of a search pattern (< and > too: `grep "<input"`) and !, which is
+ * plain text in a script. Never $, backtick, " (the quote tracker does not model an escaped quote) or a non-ASCII one; a
+ * backslash only as a pair. */
+const SAFE_QUOTED = /^[A-Za-z0-9 ._\-/:=@%+,|&;^~*?[\]{}()#'!<>]$/;
+/** What may follow a backslash inside double quotes: bash keeps both as plain text unless the next one is $, backtick, " or
+ * a backslash (or a newline), so any other printable ASCII character is fine. */
+const QUOTED_BACKSLASH = /^[\x20-\x7e]$/;
+/** Inside single quotes bash reads every character as plain text (a backslash, $, !, < >, backtick, * ? [ ] { } ( ) too), so any
+ * printable ASCII one but the closing quote may be there. No tab, newline, CR, NUL, control or non-ASCII character. */
+const SAFE_SINGLE = /^[\x20-\x26\x28-\x7e]$/;
+
+/** The line itself when every character is in the safe set, else undefined. Done before any parsing, so a comment, a
+ * backslash-newline, a CR, a no-break space and the like never reach the word splitter (which would read them differently
+ * from bash). One trailing newline is just the end of the line. */
+function safeLine(command: string): string | undefined {
+  const text = command.endsWith("\n") ? command.slice(0, -1) : command;
+  let quote: string | undefined;
+  let wordStart = true;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]!;
+    if (quote) {
+      if (char === quote) { quote = undefined; wordStart = false; continue; }
+      if (quote === "\"" && char === "\\") {
+        const next = text[index + 1];
+        // \$ and \` are a plain $ and backtick (grep "return \`"); \" and \\ stay out, as the quote tracker does not model them.
+        if (next === undefined || !QUOTED_BACKSLASH.test(next) || "\"\\".includes(next)) return undefined;
+        index++;
+        continue;
+      }
+      // A $ that starts no expansion (an end-of-line anchor: grep "^}$"): before the closing quote, a space, | or ).
+      if (quote === "\"" && char === "$" && "\" |)".includes(text[index + 1] ?? "")) continue;
+      if (!(quote === "'" ? SAFE_SINGLE : SAFE_QUOTED).test(char)) return undefined;
+      continue;
+    }
+    if (char === "'" || char === "\"") { quote = char; wordStart = false; continue; }
+    if (char === "$") {
+      const start = Math.max(text.lastIndexOf(";", index), text.lastIndexOf("|", index), text.lastIndexOf("&", index)) + 1;
+      const end = text.slice(index).search(/[;|&]/);
+      const part = text.slice(start, end < 0 ? undefined : index + end).trim();
+      if (/^(?:[A-Za-z_][A-Za-z0-9_]*=\$\?|exit[ \t]+\$[A-Za-z_][A-Za-z0-9_]*)$/.test(part)) continue;
+    }
+    if (!SAFE_BARE.test(char)) return undefined;
+    // A # that starts a word begins a comment, which hides what follows from this check but not from bash.
+    if (char === "#" && wordStart) return undefined;
+    // ~ is only safe inside a word: bash expands it at a word start or after = or : .
+    if (char === "~" && (wordStart || text[index - 1] === "=" || text[index - 1] === ":")) return undefined;
+    wordStart = " \t|&;".includes(char);
+  }
+  return quote ? undefined : text;
+}
+
+/** The line with the contents of every quoted string replaced by x (same length, quotes kept), so a check for an operator
+ * or a redirect sees only what bash reads as one. Run on a line safeLine has passed, whose quotes are balanced. */
+function maskQuoted(text: string): string {
+  let quote: string | undefined;
+  let out = "";
+  for (const char of text) {
+    if (quote) { if (char === quote) { quote = undefined; out += char; } else out += "x"; continue; }
+    if (char === "'" || char === "\"") quote = char;
+    out += char;
+  }
+  return out;
+}
+
+/** A redirect that only discards or merges output (never &>, which dash, ash and ksh read as "run in the background"), as its own word followed by a space, the end or one of ; | &&. */
+const HARMLESS_REDIRECT = /(?<=^|[ \t])(?:[12]?>\/dev\/null|2>&1)(?=$|[ \t;|]|&&)/g;
+
+/** The line with those redirects (2>/dev/null, 2>&1, >/dev/null, 1>/dev/null) blanked out. Outside quotes only: the match
+ * is made on the masked line, and the same places are blanked in the real one. */
+function withoutHarmlessRedirects(text: string): string {
+  const masked = maskQuoted(text);
+  let out = "";
+  let last = 0;
+  for (const match of masked.matchAll(HARMLESS_REDIRECT)) {
+    out += text.slice(last, match.index) + " ".repeat(match[0].length);
+    last = match.index + match[0].length;
+  }
+  return out + text.slice(last);
+}
+
+/** One command of a line: its words and text, the words with an unquoted * or ? (undefined when a word mixes one with a
+ * quoted part: which of them bash expands can't be told), and the operator after it (&&, ||, | or ;). */
+interface Part { words: string[]; text: string; globs: Set<number> | undefined; after: string | undefined; redirects: string[]; plumbing: boolean; envPaths: string[] }
+
+const ROUTINE_ENV = /^(?:TMPDIR|HOME|GIT_CEILING_DIRECTORIES|CI|NO_COLOR)=(.*)$/;
+
+/** Expand only a leading allowlisted assignment's literal $PWD path. Never another shell expansion. */
+function literalAssignments(command: string): string {
+  let cursor = 0, result = "";
+  for (const segment of splitShell(command).segments) {
+    const at = command.indexOf(segment.text, cursor);
+    const prefix = /^(?:[ \t]*(?:TMPDIR|HOME|GIT_CEILING_DIRECTORIES|CI|NO_COLOR)=(?:"[^"\n]*"|'[^'\n]*'|[^\s;&|]+)[ \t]+)+/.exec(segment.text)?.[0] ?? "";
+    const replaced = prefix.replace(/=("?)\$PWD(\/[A-Za-z0-9._/-]*)?\1(?=[ \t])/g, (_match, quote: string, suffix: string | undefined) => `=${quote}.${suffix ?? ""}${quote}`);
+    result += command.slice(cursor, at) + replaced + segment.text.slice(prefix.length);
+    cursor = at + segment.text.length;
+  }
+  return result + command.slice(cursor);
+}
+
+/** Only output redirects to one literal path. Everything left over (<, &>, descriptor tricks) still asks. */
+function projectRedirects(text: string): { text: string; files: string[] } {
+  const masked = maskQuoted(text);
+  const files: string[] = [];
+  let out = "", last = 0;
+  const redirects = /(?<=^|[ \t])[12]?>>?[ \t]*(?:'[^']*'|"[^"]*"|[^\s;&|<>]+)(?=$|[ \t;|]|&&)/g;
+  for (const match of masked.matchAll(redirects)) {
+    const raw = text.slice(match.index, match.index + match[0].length);
+    const target = raw.replace(/^[12]?>>?[ \t]*/, "");
+    const words = splitShell(target).segments[0]?.words;
+    if (!words || words.length !== 1 || /[*?]/.test(maskQuoted(target))) continue;
+    files.push(words[0]!);
+    out += text.slice(last, match.index) + " ".repeat(match[0].length);
+    last = match.index + match[0].length;
+  }
+  return { text: out + text.slice(last), files };
+}
+
+/** Project writes, unlike reads, never touch git's internals, directories, devices or private paths. */
+function redirectOk(file: string, place: Place): boolean {
+  if (place.remote || !file || !fileOk(file, place, false)) return false;
+  const absolute = resolveWord(file, place);
+  if (!absolute || !isRegularFile(absolute)) return false;
+  return [absolute, realpathLongest(absolute)].every((name) => {
+    const relative = path.relative(name === absolute ? place.root : place.realRoot, name);
+    return relative !== "" && !isOutside(relative) && !relative.split(path.sep).some((part) => part.toLowerCase() === ".git");
+  });
+}
+
+/** The line cut into its commands, or undefined when this check can't read it: a character outside the safe set, a
+ * unsupported redirect, a substitution or a background job. Literal output files are checked later in their own cwd. */
+function lineParts(command: string): Part[] | undefined {
+  const safe = safeLine(literalAssignments(command));
+  if (safe === undefined) return undefined;
+  const discarded = withoutHarmlessRedirects(safe).trim();
+  // Split the operators first so each redirect is checked in the cwd of its own command.
+  const segments = splitShell(discarded).segments;
+  const redirected = segments.map((part) => projectRedirects(part.text));
+  let cursor = 0, text = "";
+  for (const [at, segment] of segments.entries()) {
+    const start = discarded.indexOf(segment.text, cursor);
+    text += discarded.slice(cursor, start) + redirected[at]!.text;
+    cursor = start + segment.text.length;
+  }
+  text += discarded.slice(cursor);
+  if (!text || /[<>`]|\$\(|(?:^|[^&])&(?!&)/.test(maskQuoted(text))) return undefined;
+  // The line with every quote and what is inside it as \x01: what is left is what bash reads as operators and globs.
+  let quote: string | undefined;
+  let shape = "";
+  for (const char of text) {
+    if (quote) { if (char === quote) quote = undefined; shape += "\x01"; continue; }
+    if (char === "'" || char === "\"") { quote = char; shape += "\x01"; continue; }
+    shape += char;
+  }
+  const line = splitShell(text);
+  const masked = splitShell(shape);
+  const operators = shape.match(/&&|\|\||[|;]/g) ?? [];
+  if (!line.segments.length || masked.segments.length !== line.segments.length || operators.length !== line.segments.length - 1) return undefined;
+  const parts: Part[] = [];
+  for (const [at, segment] of line.segments.entries()) {
+    const words = masked.segments[at]!.words;
+    if (words.length !== segment.words.length) return undefined;
+    let globs: Set<number> | undefined = new Set();
+    for (const [index, word] of words.entries()) {
+      if (!/[*?]/.test(word)) continue;
+      if (word.includes("\x01")) { globs = undefined; break; }
+      globs.add(index);
+    }
+    const plumbing = /^(?:[A-Za-z_][A-Za-z0-9_]*=\$\?|exit[ \t]+(?:\$[A-Za-z_][A-Za-z0-9_]*|[0-9]+))$/.test(segment.text.trim())
+      && !/^(?:PATH|IFS|CDPATH|ENV|BASH_ENV|SHELLOPTS|BASHOPTS|GLOBIGNORE|LANG|LC_[A-Za-z_]+)=/.test(segment.text.trim());
+    const envPaths: string[] = [];
+    const program = [...segment.words];
+    while (ROUTINE_ENV.test(program[0] ?? "")) envPaths.push(ROUTINE_ENV.exec(program.shift()!)![1]!);
+    if (envPaths.length && globs) globs = new Set([...globs].map(index => index - envPaths.length));
+    const prefix = at < line.segments.length - 1 && (operators[at] === ";" || operators[at] === "&&")
+      && (segment.text.trim() === "set -o pipefail" || segment.text.trim() === "set -e");
+    parts.push({ words: program, text: segment.text, globs: plumbing ? new Set() : globs, after: operators[at], redirects: redirected[at]?.files ?? [], plumbing: plumbing || prefix, envPaths });
+  }
+  return parts;
+}
+
+/** The folder `cd <word>` moves to: one in the project, reached without a link, not private. Undefined otherwise. */
+function cdTarget(word: string, place: Place): string | undefined {
+  if (word.startsWith("-") || !fileOk(word, place, false)) return undefined;
+  if (place.remote) return place.cwd;
+  // bash looks a relative name up in CDPATH first (BASH_ENV can set one), so `cd app` may land outside the project.
+  // A name starting with / or . never uses it.
+  if ((process.env.CDPATH || process.env.BASH_ENV) && !/^[./\\]|^[A-Za-z]:/.test(word)) return undefined;
+  const absolute = resolveWord(word, place);
+  if (absolute === undefined) return undefined;
+  // No link on the way (`cd link && cat ../x` would read next to where the link leads): every later word is read from a
+  // folder in the project, and a leading .. means what it says.
+  const inProject = within(place.root, absolute);
+  const plain = inProject ? path.join(place.realRoot, path.relative(place.root, absolute))
+    : place.home && place.realHome ? path.join(place.realHome, path.relative(place.home, absolute)) : undefined;
+  if (plain === undefined) return undefined;
+  const real = realpathLongest(absolute);
+  return within(plain, real) && within(real, plain) ? absolute : undefined;
+}
+
+/** What splits a word for xargs when it reads names a line each (no -0): white space, quotes and a backslash. */
+const XARGS_SPLITS = /[\s'"\\]/;
+
+/** True when every name under find's start folders reaches xargs as a whole path: none holds a character xargs splits on
+ * (unless names go NUL-ended, `split` false), and no link in there leads out of the project or to a private place (wc would
+ * count it). Links are not followed, as find doesn't; too many entries and it is false. */
+function plainNamesUnder(starts: readonly string[], place: Place, split: boolean): boolean {
+  if (place.remote) return true;
+  let seen = 0;
+  const stack: string[] = [];
+  for (const start of starts) {
+    if (split && XARGS_SPLITS.test(start)) return false;
+    const absolute = resolveWord(start, place);
+    if (absolute === undefined) return false;
+    stack.push(absolute);
+  }
+  while (stack.length) {
+    const current = stack.pop()!;
+    let names: string[];
+    try { if (!lstatSync(current).isDirectory()) continue; names = readdirSync(current); } catch { continue; }
+    for (const name of names) {
+      if (++seen > ENTRY_BUDGET.max || (split && XARGS_SPLITS.test(name))) return false;
+      const full = path.join(current, name);
+      let entry;
+      try { entry = lstatSync(full); } catch { continue; }
+      if (entry.isSymbolicLink()) {
+        const real = realpathLongest(full);
+        if (!within(place.realRoot, real) || place.private.some((privatePlace) => within(privatePlace, real))) return false;
+      } else if (entry.isDirectory()) stack.push(full);
+    }
+  }
+  return true;
+}
+
+/** `find ... | xargs wc -l`: wc only counts, so the names find prints (in the project) can go to it. No other program:
+ * `xargs grep` or `xargs cat` would print files the text check never sees (a .env, or where a link leads). find must print
+ * names only (not -printf or -ls: that text would reach wc as options or paths, --files0-from=.env prints the file), and
+ * each name must reach wc whole: -print0 with xargs -0, or names with nothing in them xargs splits on. */
+function xargsCounts(findArgs: readonly string[], args: readonly string[], place: Place): boolean {
+  let index = 0;
+  let nul = false;
+  while (["-0", "-r", "--null", "--no-run-if-empty"].includes(args[index] ?? "")) { if (args[index] === "-0" || args[index] === "--null") nul = true; index++; }
+  const rest = args.slice(index + 1);
+  if (args[index] !== "wc" || !rest.every((arg) => arg.startsWith("-")) || !allowed(READERS.wc!, rest, place)) return false;
+  if (findArgs.includes("-printf") || findArgs.includes("-ls") || findArgs.includes("-print0") !== nul) return false;
+  let at = 0;
+  while (findArgs[at] === "-P") at++;
+  const starts: string[] = [];
+  for (; at < findArgs.length && !/^[-()!,]/.test(findArgs[at]!); at++) starts.push(findArgs[at]!);
+  return plainNamesUnder(starts.length ? starts : ["."], place, !nul);
+}
+
+/** Per command of the line: whether it only reads (a `cd` to a folder in the project counting as one), and the folders it
+ * may run in. Later commands are read from the folder a cd moved to (from both, when the cd may fail and they still run:
+ * after ; or on a line with ||). A cd in a pipe asks. */
+function partReads(parts: readonly Part[], place: Place): { reads: boolean[]; folders: string[][]; redirectsOk: boolean } {
+  const either = parts.some((part) => part.after === "||");
+  let folders = [place.cwd];
+  const reads: boolean[] = [];
+  const ranIn: string[][] = [];
+  for (const [at, part] of parts.entries()) {
+    ranIn.push(folders);
+    const before = parts[at - 1]?.after;
+    const [name, ...args] = part.words;
+    if (name === "cd") {
+      // Only before another command (`cd app` alone does nothing worth skipping a box for).
+      const moved = args.length === 1 && part.globs?.size === 0 && before !== "|" && (part.after === "&&" || part.after === ";")
+        ? folders.map((cwd) => cdTarget(args[0]!, { ...place, cwd })) : [undefined];
+      const fine = moved.every((folder) => folder !== undefined);
+      if (fine) folders = part.after === "&&" && !either ? moved as string[] : [...new Set([...folders, ...moved as string[]])];
+      reads.push(fine);
+      continue;
+    }
+    if (name === "xargs") {
+      reads.push(before === "|" && parts[at - 1]!.words[0] === "find" && reads[at - 1] === true && part.globs?.size === 0
+        && folders.every((cwd) => xargsCounts(parts[at - 1]!.words.slice(1), args, { ...place, cwd })));
+      continue;
+    }
+    reads.push(!part.envPaths.length && (part.words[0] === "set" && part.plumbing || part.globs !== undefined && folders.every((cwd) => readerSegment(part.words, { ...place, cwd }, part.globs))));
+  }
+  return { reads, folders: ranIn, redirectsOk: parts.every((part, at) => ranIn[at]!.every((cwd) =>
+    part.redirects.every((file) => redirectOk(file, { ...place, cwd })) && part.envPaths.every(file =>
+      Boolean(file) && !/[$~*?\\]/.test(file) && fileOk(file, { ...place, cwd }, false)))) };
+}
+
+/** True when every command on the line only reads files in the project: no redirect (but 2>/dev/null, 2>&1), no
+ * substitution, no background job, no option it doesn't know, nothing outside the project or private. Pipes, && and ;
+ * between readers are fine, and so is a leading `cd` to a folder in the project. A * or ? is expanded here, and each
+ * file it picks is checked. `where`: the project folder, or the project, your home and the private places. */
+export function readOnlyCommand(command: string, where?: ReadPlace | string): boolean {
+  const place = placeOf(where);
+  const parts = lineParts(place.home ? homeTilde(command, place.home) : command);
+  return parts !== undefined && parts.every((part) => part.redirects.length === 0 && part.envPaths.length === 0) && partReads(parts, place).reads.every(Boolean);
+}
+
+/** The line with each unquoted `~` that starts a word and is followed by `/` or the word's end written as your home
+ * folder, as bash expands it: so `cd ~/Documents/x` is checked where it goes. A quoted "~/x", `~user`, a `~` after = or :,
+ * or a home folder with a character the check doesn't take, are left as they are, and the line asks. */
+function homeTilde(command: string, home: string): string {
+  const shown = home.split(path.sep).join("/");
+  if (!/^[A-Za-z0-9._\-/:@%+,=]+$/.test(shown)) return command;
+  let out = "";
+  let quote: string | undefined;
+  let wordStart = true;
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index]!;
+    if (quote) { if (char === quote) quote = undefined; out += char; wordStart = false; continue; }
+    if (char === "'" || char === "\"") { quote = char; out += char; wordStart = false; continue; }
+    if (char === "~" && wordStart && /^(?:\/|[\s|&;]|$)/.test(command.slice(index + 1))) { out += shown; wordStart = false; continue; }
+    out += char;
+    wordStart = " \t|&;".includes(char);
+  }
+  return out;
+}
+
+/** The line's commands as this check reads them, each with whether it only reads and the folders it may run in (a cd in
+ * the project moves them), for a check of the commands that do not read (see routineCommand). Undefined when the line
+ * can't be read: a character outside the safe set, an unsafe redirect, a substitution, a subshell or a background job. A command
+ * with a * or ? that can't be told apart from a quoted part has `globs` undefined. */
+export function lineCommands(command: string, where?: ReadPlace | string):
+  { root: string; realRoot: string; commands: Array<{ words: string[]; globs: boolean; reads: boolean; folders: string[]; plumbing: boolean }> } | undefined {
+  const parts = lineParts(command);
+  if (!parts) return undefined;
+  const place = placeOf(where);
+  const { reads, folders, redirectsOk } = partReads(parts, place);
+  if (!redirectsOk || parts.some((part, at) => part.redirects.length && parts.slice(0, at).some((prior, before) => !reads[before] && !prior.plumbing))) return undefined;
+  return { root: place.root, realRoot: place.realRoot, commands: parts.map((part, at) => ({ words: part.words, globs: part.globs?.size !== 0, reads: reads[at]!, folders: folders[at]!, plumbing: part.plumbing })) };
+}
+
+/** Shell builtins that change the shell itself (its folder, variables, aliases, options): what runs after them on the line
+ * is no longer what the check saw, so they are never the one command a "don't ask again" answer covers. */
+const SHELL_STATE = new Set(["cd", "pushd", "popd", "export", "set", "unset", "alias", "unalias", "declare", "typeset", "local", "readonly",
+  "shopt", "source", ".", "eval", "exec", "trap", "umask", "ulimit", "hash", "enable", "builtin", "command", "let", "read", "mapfile",
+  "readarray", "shift", "getopts", "function", "exit", "return", "history", "fc", "bind", "complete", "compgen"]);
+
+/** Where the line's one command that is not a plain read sits, when everything else on the line is (a cd in the project and
+ * readers before it, and after it only a pipe into readers of what it prints, like `| tail -25`). Nothing that reads a file
+ * may come after it: the files were checked before the line ran, and the command may change them (`git pull && cat x`,
+ * where x became a link). */
+function coreAt(parts: readonly Part[], reads: readonly boolean[], place: Place): number | undefined {
+  const at = reads.indexOf(false);
+  if (at < 0 || reads.indexOf(false, at + 1) >= 0) return undefined;
+  const name = parts[at]!.words[0];
+  if (!name || name.includes("=") || SHELL_STATE.has(name)) return undefined;
+  for (let next = at + 1; next < parts.length; next++) {
+    if (parts[next - 1]!.after !== "|" || !parts[next]!.globs || !readerSegment(parts[next]!.words, place, parts[next]!.globs, true)) return undefined;
+  }
+  return at;
+}
+
+/** The line's one command that is not a plain read (see coreAt): `cd app && npm test 2>&1 | tail -25` is `npm test`. Its
+ * text, or undefined. A prefix an older Casper saved for "Yes, always for this project" covers a line whose command starts
+ * with it. A program named by a relative path after a cd is given from the project folder (`cd sub && ./build.sh` is
+ * `./sub/build.sh`), so it never matches another folder's. */
+export function commandCore(command: string, where?: ReadPlace | string): string | undefined {
+  const parts = lineParts(command);
+  if (!parts || parts.some((part) => part.redirects.length || part.plumbing)) return undefined;
+  const place = placeOf(where);
+  const { reads, folders } = partReads(parts, place);
+  const at = coreAt(parts, reads, place);
+  if (at === undefined) return undefined;
+  const core = parts[at]!;
+  const name = core.words[0]!;
+  const cwds = folders[at]!;
+  if (!name.includes("/") || name.startsWith("/") || (cwds.length === 1 && cwds[0] === place.cwd)) return core.text;
+  if (cwds.length !== 1 || !core.text.startsWith(name)) return undefined;
+  const fromRoot = path.relative(place.root, path.resolve(cwds[0]!, name));
+  if (isOutside(fromRoot)) return undefined;
+  return `./${fromRoot.split(path.sep).join("/")}${core.text.slice(name.length)}`;
+}
+
+/** What a "Yes, for this session" or "Yes, always for this project" answer remembers, and what a later line must equal to be
+ * covered (test-run session families are separate): the line's one command that is not a plain read (see coreAt), with the folder it runs in when that is not the
+ * project folder (`cd app && npm test 2>&1 | tail -25` is `cd app && npm test`), so the same words in another folder ask
+ * again. The whole line when there is no such command, or when anything is piped into it (`cat a.sh | sh` runs its input,
+ * so `echo x | sh` is another command). */
+export function answerKey(command: string, where?: ReadPlace | string): string {
+  const parts = lineParts(command);
+  if (!parts || parts.some((part) => part.redirects.length || part.plumbing)) return command;
+  const place = placeOf(where);
+  const { reads, folders } = partReads(parts, place);
+  const at = coreAt(parts, reads, place);
+  if (at === undefined || parts[at - 1]?.after === "|") return command;
+  const cwds = folders[at]!;
+  if (cwds.length !== 1) return command;
+  const text = parts[at]!.text;
+  if (cwds[0] === place.cwd) return text;
+  const from = path.relative(place.root, cwds[0]!);
+  if (!from || isOutside(from)) return command;
+  const folder = from.split(path.sep).join("/");
+  return `cd ${/^[\w./-]+$/.test(folder) ? folder : `'${folder}'`} && ${text}`;
+}
+
+/** Session-only runner approval: vary project test files and read/status plumbing, never another program or folder. */
+export function testRunKey(command: string, where: ReadPlace | string): string | undefined {
+  const parts = lineParts(command);
+  if (!parts) return undefined;
+  const place = placeOf(where);
+  const { reads, folders, redirectsOk } = partReads(parts, place);
+  if (!redirectsOk) return undefined;
+  let runner: string | undefined;
+  const logs = new Set<string>();
+  for (const [at, part] of parts.entries()) {
+    if (runner && part.redirects.length) return undefined;
+    if (part.plumbing) continue;
+    if (reads[at]) {
+      // After tests, only their pipe output or an explicitly redirected log may be read, not arbitrary files.
+      if (runner && !folders[at]!.every((cwd) => {
+        const here = { ...place, cwd };
+        return parts[at - 1]?.after === "|"
+          ? readerSegment(part.words, here, part.globs, true)
+          : part.words[0] === "tail" && part.globs?.size === 0 && allowed({ ...READERS.tail!, maxWords: 1,
+            check: (words) => words.length === 1 && logs.has(path.resolve(cwd, words[0]!)) }, part.words.slice(1), here);
+      })) return undefined;
+      continue;
+    }
+    if (runner || parts[at - 1]?.after === "|" || part.globs?.size !== 0 || part.words[0] !== "bun" || part.words[1] !== "test") return undefined;
+    const cwds = folders[at]!;
+    if (cwds.length !== 1) return undefined;
+    const here = { ...place, cwd: cwds[0]! };
+    const args = part.words.slice(2);
+    const flags = new Set(["--parallel", "--watch", "--coverage", "--only", "--todo", "--bail", "--pass-with-no-tests", "--randomize", "--update-snapshots", "-u"]);
+    const numeric = new Set(["--timeout", "--max-concurrency", "--rerun-each", "--seed"]);
+    for (let index = 0; index < args.length; index++) {
+      const arg = args[index]!;
+      if (flags.has(arg)) continue;
+      const [name, value] = arg.split("=");
+      if (numeric.has(name!)) {
+        if (!/^\d+$/.test(value ?? args[++index] ?? "")) return undefined;
+      } else if (arg.startsWith("-") || !fileOk(arg, here, false)) return undefined;
+    }
+    for (const file of part.redirects) logs.add(path.resolve(here.cwd, file));
+    runner = `test-run:${JSON.stringify([place.realRoot, realpathLongest(here.cwd), "bun test"])}`;
+  }
+  return runner;
+}
+
+/** The git folder a project belongs to, found the way git does: the nearest .git going up from the project (a folder,
+ * a link to one, or a .git file that points to one). "unknown" when it can't be worked out: callers then ask. */
+function gitDirOf(folder: string): string | undefined | "unknown" {
+  for (let dir = folder; ; dir = path.dirname(dir)) {
+    const dot = path.join(dir, ".git");
+    try {
+      if (statSync(dot).isDirectory()) return realpathSync(dot);
+      const target = /^gitdir:\s*(.+)$/m.exec(readFileSync(dot, "utf8"))?.[1]?.trim();
+      return target ? realpathSync(path.resolve(dir, target)) : "unknown";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unknown";
+    }
+    if (dir === path.dirname(dir)) return undefined;
+  }
+}
+
+/** True when an index entry has the gitlink mode (a submodule or nested repository). A version 4 index, or one that
+ * can't be read, counts as holding one: asking costs less than guessing. */
+function indexHasGitlink(file: string): boolean {
+  let data: Buffer;
+  try { data = readFileSync(file); } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+  if (data.length < 12 || data.toString("latin1", 0, 4) !== "DIRC") return true;
+  const version = data.readUInt32BE(4);
+  if (version !== 2 && version !== 3) return true;
+  const count = data.readUInt32BE(8);
+  let at = 12;
+  for (let entry = 0; entry < count; entry++) {
+    if (at + 62 > data.length) return true;
+    if ((data.readUInt32BE(at + 24) >> 12) === 0o16) return true;
+    const flags = data.readUInt16BE(at + 60);
+    let nameStart = at + 62;
+    if (version === 3 && flags & 0x4000) nameStart += 2;
+    let nameEnd = nameStart + (flags & 0xfff);
+    if ((flags & 0xfff) === 0xfff) { nameEnd = data.indexOf(0, nameStart); if (nameEnd < 0) return true; }
+    at += Math.ceil((nameEnd - at + 1) / 8) * 8;
+  }
+  // Extensions: a split index ("link") keeps its entries in a shared file, a sparse index ("sdir") folds them into trees.
+  while (at + 8 <= data.length - 20) {
+    const name = data.toString("latin1", at, at + 4);
+    if (name === "link" || name === "sdir") return true;
+    at += 8 + data.readUInt32BE(at + 4);
+  }
+  return false;
+}
+
+/** True when the project's git repository has submodules or gitlinks: a .gitmodules file in the project or any folder
+ * above it, a .git/modules folder (also the main repository's, for a worktree), or a gitlink in the index. */
+function hasSubmodules(root: string): boolean {
+  for (let folder = root; ; folder = path.dirname(folder)) {
+    try { lstatSync(path.join(folder, ".gitmodules")); return true; } catch { /* none here */ }
+    if (folder === path.dirname(folder)) break;
+  }
+  const gitDir = gitDirOf(root);
+  if (gitDir === undefined) return false;
+  if (gitDir === "unknown") return true;
+  const common = path.basename(path.dirname(gitDir)) === "worktrees" ? path.resolve(gitDir, "..", "..") : gitDir;
+  for (const dir of new Set([gitDir, common])) {
+    try { if (lstatSync(path.join(dir, "modules")).isDirectory()) return true; } catch { /* none */ }
+    try { if (readdirSync(dir).some((name) => name.startsWith("sharedindex."))) return true; } catch { return true; }
+  }
+  return indexHasGitlink(path.join(gitDir, "index"));
+}
+
+/** True when `command` is one plain command starting with the prefix's words, each the same word: a prefix an older
+ * Casper kept for "Yes, always for this project" (it keeps exact commands now). Only the program name is relaxed, and
+ * only on Windows: npm.cmd and NPM.EXE are npm (a name with a folder never is). A line with any space other than a plain
+ * space or tab (a no-break space, a form feed) never matches: the shell reads those as part of a word, so they are a
+ * different command from the one that was approved. */
+export function matchesPrefix(command: string, prefix: string, windows = process.platform === "win32"): boolean {
+  // The line as typed: trim() would strip a leading or trailing no-break space and hide the very thing this looks for.
+  if (/[^\S \t]/.test(command)) return false;
+  const line = splitShell(command.trim());
+  if (!line.simple) return false;
+  const words = line.segments[0]?.words ?? [];
+  // The folder test looks at the program word as typed: after splitting, a backslash is gone (`\npm.cmd` becomes `npm.cmd`).
+  const typedTool = command.trimStart().split(/[ \t]/)[0] ?? "";
+  // ASCII letters only: toLowerCase also turns the Kelvin sign (U+212A) into "k", which Windows file names do not do.
+  // An ending is dropped only when something is left (".cmd" alone stays ".cmd").
+  const tool = (word: string) => {
+    if (!windows || /[\\/]/.test(typedTool) || /[\\/]/.test(word)) return word;
+    const lower = word.replace(/[A-Z]/g, (char) => char.toLowerCase());
+    return lower.replace(/(?<=.)\.(?:exe|cmd|bat|com|ps1)$/, "");
+  };
+  return prefix.split(" ").every((word, index) => {
+    const have = words[index];
+    return have !== undefined && (index === 0 ? tool(have) === tool(word) : have === word);
+  });
+}
+
+/** docker (and podman) subcommands that only look: `docker ps`, `docker compose ps`, `docker image ls`. */
+const DOCKER_LOOKS = new Set(["ps", "logs", "inspect", "images", "version", "info", "stats", "top", "port", "history", "events", "search", "diff"]);
+const DOCKER_GROUP_LOOKS = new Set(["ls", "list", "inspect", "logs", "top", "port", "stats", "history", "df", "info", "show", "ps", "version", "config", "images", "events"]);
+const DOCKER_GROUPS = new Set(["container", "image", "network", "volume", "context", "system", "compose", "node", "service", "stack", "secret", "plugin", "buildx", "builder"]);
+
+function dockerLooks(args: readonly string[]): boolean {
+  const words: string[] = [];
+  for (let at = 0; at < args.length; at++) {
+    const arg = args[at]!;
+    // Options that take a value as the next word (`--context nas`, `-f compose.yml`, `--format {{.Names}}`).
+    if (/^(?:-[Hcfp]|--(?:context|host|config|log-level|file|project-name|project-directory|format|filter|since|until|tail|env-file|profile))$/.test(arg)) { at++; continue; }
+    if (!arg.startsWith("-")) words.push(arg);
+    if (words.length === 2) break;
+  }
+  const [first, second] = words;
+  if (first && DOCKER_GROUPS.has(first)) return second !== undefined && DOCKER_GROUP_LOOKS.has(second) && !(first === "secret" && second === "inspect");
+  return first !== undefined && DOCKER_LOOKS.has(first);
+}
+
+/** Programs that only look at a server (or a Windows PC), for remoteReadOnly: what each may be given. */
+const SERVER_READS: Record<string, (args: readonly string[]) => boolean> = {
+  docker: dockerLooks, podman: dockerLooks, "docker-compose": (args) => dockerLooks(["compose", ...args]),
+  systemctl: (args) => ["status", "is-active", "is-enabled", "is-failed", "is-system-running", "show", "list-units", "list-unit-files", "list-timers",
+    "list-sockets", "list-dependencies", "cat"].includes(args.find((arg) => !arg.startsWith("-")) ?? ""),
+  journalctl: (args) => !args.some((arg) => /^--(?:vacuum|rotate|flush|sync|relinquish|smart-relinquish|setup-keys|update-catalog)/.test(arg)),
+  ip: (args) => {
+    const words = args.filter((arg) => !arg.startsWith("-"));
+    return /^(?:a|addr|address|r|ro|route|l|link|n|neigh|rule|-?br)$/.test(words[0] ?? "")
+      && words.slice(1).every((arg) => !/^(?:add|del|delete|change|replace|set|flush|append|prepend|save|restore)$/.test(arg));
+  },
+  ss: (args) => !args.some((arg) => /^(?:-[A-Za-z]*K|--kill)$/.test(arg)),
+  netstat: () => true, free: () => true, uptime: () => true, lsblk: () => true, lscpu: () => true, nproc: () => true, arch: () => true,
+  getent: () => true, w: () => true, who: () => true, last: () => true, lsof: () => true, findmnt: () => true, pgrep: () => true, pidof: () => true,
+  printenv: () => true, env: (args) => args.length === 0, mount: (args) => args.length === 0, df: () => true, vmstat: () => true, iostat: () => true,
+  sleep: (args) => args.length > 0 && args.every((arg) => /^\d+(?:\.\d+)?[smhd]?$/.test(arg)),
+  ping: (args) => !args.some((arg) => /^-[A-Za-z]*f/.test(arg)), dig: () => true, nslookup: () => true, host: () => true,
+  ifconfig: (args) => args.length === 0 || (args.length === 1 && /^-?a$|^[\w.:-]+$/.test(args[0]!)),
+  dmesg: (args) => !args.some((arg) => /^(?:-[A-Za-z]*[cCDE]|--(?:clear|read-clear|console-off|console-on|console-level))/.test(arg)),
+  // awk with a program that prints: no system(), pipes, files or getline.
+  awk: (args) => !args.some((arg) => /^-[A-Za-z]*f|^--file/.test(arg)) && !args.some((arg) => /system\s*\(|\||>|getline|close\s*\(/.test(arg)),
+  curl: (args) => !args.some((arg) => /^(?:-[A-Za-z]*[dFTOoKcuX]|--(?:data|form|upload|output|remote-name|config|cookie-jar|request|json|user|post)|-D)/.test(arg)),
+  // Windows over ssh: cmd's and PowerShell's looks.
+  ver: () => true, systeminfo: () => true, tasklist: () => true, whoami: () => true, hostname: (args) => args.length === 0,
+  ipconfig: (args) => !args.some((arg) => /^[/-](?:release|renew|flushdns|registerdns|setclassid)/i.test(arg)),
+};
+
+/** Shell words around a command that run nothing themselves: `do`, `then`, `done`, `fi`, `{`. */
+const SHELL_WRAP = /^(?:do|then|else|elif|if|while|until|!|\{)\s+/;
+const SHELL_CLOSE = /^(?:done|fi|esac|\}|else|do|then)$/;
+
+/**
+ * Whether one command sent to another machine (`ssh nas 'docker ps 2>&1 | head'`) only looks there: the same allow-list
+ * and option checks this computer's reads use (ls, cat, grep, find, git's reads, version-only), plus programs that only
+ * look at a server (docker ps, systemctl status, ip addr, ss, journalctl, Windows' ver). Files are not checked: they are
+ * on that machine, and reading one changes nothing. Display only (what Casper calls a change), never permission: a
+ * write, an unknown program or option, a substitution or a background job is not a look.
+ */
+export function remoteReadOnly(command: string): boolean {
+  let text = command.trim();
+  while (SHELL_WRAP.test(text)) text = text.replace(SHELL_WRAP, "");
+  if (!text || SHELL_CLOSE.test(text) || /^for\s+\w+\s+in\b/.test(text)) return true;
+  // A subshell's parentheses group commands; a `$(` runs one and is not a look.
+  let out = "", quote: string | undefined;
+  for (let at = 0; at < text.length; at++) {
+    const char = text[at]!;
+    if (quote) { if (char === quote) quote = undefined; out += char; continue; }
+    if (char === "\\") { out += char + (text[at + 1] ?? ""); at++; continue; }
+    if (char === "'" || char === "\"") { quote = char; out += char; continue; }
+    if (char === "(" && text[at - 1] === "$") return false;
+    if (char === "(" || char === ")") { out += " "; continue; }
+    out += char;
+  }
+  text = out
+    // cmd's `2>nul` and `&>/dev/null` only drop output.
+    .replace(/(?<=^|\s)(?:[12]?>nul|&>\/dev\/null)(?=$|\s)/gi, " ")
+    // A variable is a value there ($HOME, ${N}); a $ before a space or quote is a plain $ (`name=^app$`).
+    .replace(/(?<!\\)\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9?#])/g, (match, offset: number, whole: string) => inSingleQuotes(whole, offset) ? match : "VAR")
+    .replace(/(?<!\\)\$(?=[\s"]|$)/g, "")
+    .trim();
+  // `cd /volume1/app` alone: where the next commands run there.
+  if (/^cd(?:\s+[^\s;&|<>`$]+)?$/.test(text)) return true;
+  // `n=0`, `name=x` alone: a shell variable there.
+  if (/^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>`]*\s*)+$/.test(text)) return true;
+  const parts = lineParts(text);
+  const place: Place = { root: "/", realRoot: "/", private: [], cwd: "/", remote: true };
+  return parts !== undefined && parts.every((part) => part.redirects.length === 0 && part.envPaths.length === 0) && partReads(parts, place).reads.every(Boolean);
+}
+
+function inSingleQuotes(text: string, offset: number): boolean {
+  let quote: string | undefined;
+  for (let at = 0; at < offset; at++) {
+    const char = text[at]!;
+    if (quote) { if (char === quote) quote = undefined; continue; }
+    if (char === "\\") { at++; continue; }
+    if (char === "'" || char === "\"") quote = char;
+  }
+  return quote === "'";
+}
