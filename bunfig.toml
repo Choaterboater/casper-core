@@ -1,0 +1,3 @@
+# casper-core's own suite lives in tests/.
+[test]
+root = "tests"
