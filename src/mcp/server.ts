@@ -37,14 +37,23 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        command: { type: "string", description: "The project's test command, exactly as the project runs it." },
-        name: { type: "string", description: "Check name. Default: test." },
+        commands: {
+          type: "array",
+          description: "One or more checks, run in order. The check named test proves the change; the others are facts.",
+          items: {
+            type: "object",
+            properties: { name: { type: "string" }, command: { type: "string" } },
+            required: ["command"],
+            additionalProperties: false,
+          },
+        },
+        command: { type: "string", description: "One check, when there is only one. Shorthand for a single entry in commands." },
+        name: { type: "string", description: "Name for the single command. Default: test." },
         require_proof: { type: "boolean", description: "Compare with the baseline: the check must fail without the change." },
         baseline: { type: "string", description: "Handle from capture_baseline, taken before the change." },
         requirements: { type: "array", items: { type: "string" }, description: "Requirements declared by the caller, echoed back." },
         path: { type: "string", description: "Workspace folder. Default: the server's working directory." },
       },
-      required: ["command"],
       additionalProperties: false,
     },
   },
@@ -118,13 +127,28 @@ async function captureTool(args: Record<string, unknown>): Promise<ToolResult> {
   return result(`baseline: ${baseline.handle}`, { exitCode: 0, baseline: baseline.handle }, false);
 }
 
+/** `commands` when given, otherwise the single `command` shorthand. Names default to test, or check1, check2. */
+function checksOf(args: Record<string, unknown>): CheckSpec[] {
+  const list = Array.isArray(args.commands) ? args.commands : [];
+  if (list.length) {
+    return list.map((entry, index) => {
+      const item = entry as Record<string, unknown>;
+      if (typeof item.command !== "string" || !item.command) throw new Error(`commands[${index}].command is required`);
+      const fallback = list.length === 1 ? "test" : `check${index + 1}`;
+      return { name: typeof item.name === "string" && item.name ? item.name : fallback, command: item.command };
+    });
+  }
+  if (typeof args.command === "string" && args.command) {
+    return [{ name: typeof args.name === "string" && args.name ? args.name : "test", command: args.command }];
+  }
+  throw new Error("command or commands is required");
+}
+
 async function verifyTool(args: Record<string, unknown>): Promise<ToolResult> {
   const workspace = workspaceOf(args);
-  if (typeof args.command !== "string" || !args.command) throw new Error("command is required");
-  const name = typeof args.name === "string" && args.name ? args.name : "test";
+  const checks = checksOf(args);
   const requireProof = args.require_proof === true;
   const baseline = await openBaseline(workspace, args);
-  const checks: CheckSpec[] = [{ name, command: args.command }];
 
   const evidence = await verifyChange({
     context: { workspace, home: os.homedir(), sandbox: false },

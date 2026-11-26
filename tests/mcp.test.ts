@@ -98,6 +98,34 @@ test("a proven change returns evidence and the host may claim it", async () => {
   expect(host.claimedDone).toBe(true);
 });
 
+test("verify_change runs every check it is given, not just the first", async () => {
+  const workspace = await project();
+  baseline = await ChangeBaseline.capture(workspace, { command: "bun test", pathContext: { home } });
+  await writeFiles(workspace, { "src/sum.js": FIXED_SUM });
+  const connected = await connect();
+
+  const result = await connected.callTool({
+    name: "verify_change",
+    arguments: {
+      path: workspace,
+      commands: [
+        { name: "lint", command: "bun test tests/does-not-exist.test.js" },
+        { name: "test", command: "bun test" },
+      ],
+      require_proof: true,
+      baseline: baseline.handle,
+    },
+  });
+
+  expect(exitOf(result)).toBe(EXIT.checksFailed);
+  const evidence = (result.structuredContent as { evidence: { checks: Array<{ name: string; status: string }> } }).evidence;
+  expect(evidence.checks.map((check) => [check.name, check.status])).toEqual([["lint", "fail"], ["test", "pass"]]);
+  const text = (result.content as Array<{ text: string }>)[0]!.text;
+  expect(text).toContain("refused: a check failed");
+  expect(text).toContain("lint");
+  expect(text).toContain("exit: 1");
+});
+
 test("an unproven change is refused and the host does not claim it", async () => {
   const workspace = await project(FIXED_SUM);
   baseline = await ChangeBaseline.capture(workspace, { command: "bun test", pathContext: { home } });

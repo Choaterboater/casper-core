@@ -22,6 +22,8 @@ Call `capture_baseline` with the project's test command:
 
 Keep the `baseline:` handle. It is a folder path.
 
+When the project has several checks, send `commands` instead: an array of `{ "name": "lint", "command": "..." }`. They all run, every failure is named, and the check called `test` is the one that proves the change.
+
 ## After the change
 
 Call `verify_change`:
