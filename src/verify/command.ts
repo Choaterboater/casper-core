@@ -1,0 +1,331 @@
+import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
+import type { CheckName, CommandResult } from "../evidence";
+import { withoutProviderKeys } from "../platform/environment";
+import { osSupportsProcessGroups, ownSpawnedTree, type OwnedProcesses, ProcessCleanupError, terminateTree } from "../platform/processes";
+import { type CheckProgress, ProgressFeed } from "./progress";
+import type { CommandSandbox, SandboxWrapOptions } from "../sandbox/types";
+
+/** Overall wall-clock limit for each command check, not a per-test or idle-output limit. */
+export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
+
+const OUTPUT_BYTES = 8192;
+
+// A line that names the real failure in a long build or test log: a compiler error, a missing import, a failed
+// test or assertion.
+const DIAGNOSTIC = /error TS\d+|is not exported|has no exported member|Cannot find module|Module not found|ModuleNotFoundError|ImportError|AssertionError|SyntaxError|:\d+:\d+:?\s*(?:error|fatal)\b|^\s*(?:FAIL\b|\(fail\)|✗|✕|×)/;
+const MIDDLE_LINES = 20;
+const MIDDLE_BYTES = 2048;
+const LINE_CHARS = 300;
+
+// Drain all output, retaining a bounded head and tail of each stream. A sandbox refusal and a test's own time
+// limit are looked for in all of it as it streams: in a long test run that line sits in the middle, which the head
+// and tail cut out. So are up to 20 distinct error lines, which go back in between the head and the tail.
+class OutputCapture {
+  private head = Buffer.alloc(0);
+  private tail = Buffer.alloc(0);
+  private size = 0;
+  private carry = "";
+  private decoder = new StringDecoder("utf8");
+  private line = "";
+  private lineStart = 0;
+  private found: { text: string; start: number; end: number }[] = [];
+  denial?: string;
+  slowTest = false;
+
+  add(chunk: Buffer): void {
+    const at = this.size;
+    this.size += chunk.length;
+    if (!this.denial || !this.slowTest) {
+      const text = this.carry + chunk.toString("latin1");
+      this.denial ??= DENIAL.exec(text)?.[0];
+      this.slowTest ||= TEST_TIMED_OUT.test(text);
+      this.carry = text.slice(-64); // A line split across two chunks.
+    }
+    if (this.found.length < MIDDLE_LINES) this.scan(chunk, at);
+    const headBytes = Math.min(chunk.length, OUTPUT_BYTES / 2 - this.head.length);
+    if (headBytes > 0) this.head = Buffer.concat([this.head, chunk.subarray(0, headBytes)]);
+    const remainder = chunk.subarray(headBytes);
+    this.tail = Buffer.concat([this.tail, remainder]).subarray(-OUTPUT_BYTES / 2);
+  }
+
+  private scan(chunk: Buffer, at: number): void {
+    let pos = 0;
+    let index: number;
+    while ((index = chunk.indexOf(10, pos)) !== -1) {
+      this.line += this.decoder.write(chunk.subarray(pos, index));
+      this.keep(at + index);
+      pos = index + 1;
+      this.lineStart = at + pos;
+      if (this.found.length >= MIDDLE_LINES) return;
+    }
+    // Only the start of a very long line is looked at.
+    if (this.line.length < 4 * LINE_CHARS) this.line += this.decoder.write(chunk.subarray(pos));
+  }
+
+  private keep(end: number): void {
+    const text = this.line.replace(/\x1b\[[\d;]*[A-Za-z]/g, "").trimEnd().slice(0, LINE_CHARS);
+    this.line = "";
+    this.decoder = new StringDecoder("utf8");
+    if (end > OUTPUT_BYTES / 2 && DIAGNOSTIC.test(text) && !this.found.some((line) => line.text === text)) {
+      this.found.push({ text, start: this.lineStart, end });
+    }
+  }
+
+  get truncated(): boolean { return this.size > OUTPUT_BYTES; }
+  text(): string {
+    // Decode intact output as one buffer: the head/tail boundary can bisect
+    // a multibyte character even when no bytes were discarded.
+    if (!this.truncated) return Buffer.concat([this.head, this.tail]).toString("utf8");
+    const tail = this.tail.toString("utf8");
+    return this.head.toString("utf8") + "\n[...output truncated...]\n" + this.middle(tail) + tail;
+  }
+
+  /** The error lines that fell between the head and the tail, within MIDDLE_BYTES. */
+  private middle(tail: string): string {
+    const cut = this.size - this.tail.length;
+    const lines: string[] = [];
+    let bytes = 0;
+    for (const line of this.found) {
+      if (line.start >= cut || tail.includes(line.text)) continue;
+      bytes += Buffer.byteLength(line.text) + 1;
+      if (bytes > MIDDLE_BYTES) break;
+      lines.push(line.text);
+    }
+    return lines.length ? `Lines from the cut middle:\n${lines.join("\n")}\n[...]\n` : "";
+  }
+}
+
+/** How a check starts: a shell command line (`shell: true`, `file` is the whole line) or a program and its
+ * argument list, never through a shell. */
+export interface SpawnPlan { file: string; args: string[]; shell: boolean }
+
+/** Rewrites how a check starts, e.g. to run it inside the shell sandbox. It sees the plan and the folder and
+ * returns the plan to spawn. The check's shown command stays the one the project gave. */
+export type CommandWrap = (plan: SpawnPlan, context: { cwd: string; name: CheckName }) => SpawnPlan | Promise<SpawnPlan>;
+
+/** An argument list as one readable line: plain words stay bare, anything else is single-quoted. */
+export function argvText(argv: readonly string[]): string {
+  return argv.map((arg) => /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`).join(" ");
+}
+
+export interface CommandCheckOptions {
+  name: CheckName;
+  /** A shell command line, run the way verify.test always has been. Give this or `argv`. */
+  command?: string;
+  /** A program and its arguments, run without a shell: a file named `$(touch x)` is only ever a file name. */
+  argv?: readonly string[];
+  /** A start hook that replaces the caller's shell sandbox (tests, or a caller with its own). */
+  wrap?: CommandWrap;
+  /** The sandbox that holds this run. Unset: no sandbox. */
+  sandbox?: CommandSandbox;
+  /** How that sandbox holds this run (network, extra write folders). */
+  sandboxOptions?: Omit<SandboxWrapOptions, "cwd">;
+  cwd: string;
+  /** Overall command deadline, including quiet or CPU-bound workers; output never resets it. */
+  timeoutMs: number;
+  signal?: AbortSignal;
+  /** The host reports owned processes and offers Stop/Leave when cleanup is uncertain. */
+  onCleanupFailure?: (error?: ProcessCleanupError) => void;
+  /** The command's environment; unset inherits Casper's. AI provider keys are always taken out. */
+  env?: NodeJS.ProcessEnv;
+  /** Told how the run goes (start, the end of its output, end) for the Working box. Unset: the app's own sink, if any. */
+  progress?: CheckProgress;
+}
+
+// cmd.exe's "not found", and `cmd /c` exits 1 (9009 inside a batch file).
+const CMD_NOT_FOUND = /^\s*'[^'\r\n]+' is not recognized as an internal or external command,\r?\noperable program or batch file\.\s*$/;
+
+/** A timeout, a command that could not execute, or the shell's 126 (not executable) / 127 (not found). On
+ * Windows the shell is cmd.exe: its "not recognized" as all the check printed, or 9009, is "not found" (a suite
+ * that failed and then printed that text is a failure). */
+export function checkEnded(exitCode: number | null, reason?: string, stderr = "", platform: NodeJS.Platform = process.platform, stdout = ""): CommandResult["ended"] {
+  if (reason?.startsWith("Timed out")) return "timeout";
+  // The command passed, but something it started was still running when it ended: unfinished, never a pass
+  // (decision 17) and never the code failing. A command that failed on its own stays a failure.
+  if (exitCode === 0 && reason?.startsWith("Owned process cleanup is unconfirmed")) return "cleanup";
+  if (reason?.startsWith("Could not execute") || exitCode === 126 || exitCode === 127) return "no_start";
+  if (platform === "win32" && (exitCode === 9009 || (exitCode === 1 && !stdout.trim() && CMD_NOT_FOUND.test(stderr)))) return "no_start";
+  return undefined;
+}
+
+export async function runCommandCheck(options: CommandCheckOptions): Promise<CommandResult> {
+  const { name, cwd, timeoutMs, signal } = options;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3_600_000) {
+    throw new Error("Verification timeout must be between 1 and 3600000ms");
+  }
+  if ((options.command === undefined) === (options.argv === undefined)) throw new Error("A check needs either a command or an argument list");
+  if (options.argv && (!options.argv.length || !options.argv[0])) throw new Error("A check's argument list needs a program");
+  const command = options.command ?? argvText(options.argv!);
+  const direct: SpawnPlan = options.argv ? { file: options.argv[0]!, args: options.argv.slice(1), shell: false } : { file: command, args: [], shell: true };
+  // A check runs in the sandbox the caller passed, unless that project's checks run outside it.
+  const session = options.wrap ? undefined : options.sandbox;
+  const outside = session ? await session.checksOutside() : false;
+  const sandbox: CommandSandbox | undefined = outside ? undefined : session;
+  const where = outside ? { label: "outside the sandbox" } : {};
+  const started = performance.now();
+  const stdout = new OutputCapture();
+  const stderr = new OutputCapture();
+  const base = () => ({
+    name, command, cwd, ...where,
+    stdout: stdout.text(), stderr: stderr.text(),
+    truncated: stdout.truncated || stderr.truncated,
+    durationMs: Math.round(performance.now() - started),
+  });
+  if (signal?.aborted) {
+    return { ...base(), status: "fail", exitCode: null, signal: null, reason: "Verification cancelled" };
+  }
+  let plan: SpawnPlan;
+  let held: string | undefined;
+  try {
+    if (options.wrap) plan = await options.wrap({ ...direct, args: [...direct.args] }, { cwd, name });
+    else if (sandbox?.on) {
+      const wrapped = await sandbox.wrap(command, { cwd, ...options.sandboxOptions });
+      plan = wrapped.held ? { file: wrapped.command, args: [], shell: true } : direct;
+      if (wrapped.held) held = wrapped.id;
+    } else plan = direct;
+  } catch (error) {
+    // The sandbox failed to start just now (it said so): this check runs as the later ones will, not sandboxed,
+    // and the receipt says so.
+    if (sandbox?.failure) plan = direct;
+    else return { ...base(), status: "fail", exitCode: null, signal: null, reason: `Could not execute: ${error instanceof Error ? error.message : String(error)}`, ended: "no_start" };
+  }
+
+  return new Promise((resolve) => {
+    let reason: string | undefined;
+    // Track descendants too: Bun's parallel workers lead their own process groups.
+    // Windows has no groups and terminates verified descendants.
+    let child;
+    let owner: OwnedProcesses | undefined;
+    try {
+      child = spawn(plan.file, plan.args, { cwd, shell: plan.shell, windowsHide: true, detached: osSupportsProcessGroups, stdio: ["ignore", "pipe", "pipe"], env: withoutProviderKeys(options.env ?? process.env) });
+      owner = ownSpawnedTree(child.pid, () => child!.exitCode === null && child!.signalCode === null, { trackGroups: true });
+    } catch (error) {
+      resolve({ ...base(), status: "fail", exitCode: null, signal: null, reason: `Could not execute: ${error instanceof Error ? error.message : String(error)}`, ended: "no_start" });
+      return;
+    }
+    const feed = new ProgressFeed(options.progress, name);
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    let closed = false;
+    let settled = false;
+    let cleanupError: ProcessCleanupError | undefined;
+    const reportCleanup = () => {
+      if (!cleanupError) { cleanupError = new ProcessCleanupError(owner); options.onCleanupFailure?.(cleanupError); }
+      return cleanupError;
+    };
+    const kill = async (terminationSignal: NodeJS.Signals) => {
+      const outcome = await terminateTree(owner, child.pid, terminationSignal);
+      if (outcome === "unknown" && !settled) {
+        reason = reportCleanup().message;
+        // An unverified root may still own open pipes. Do not wait forever for
+        // close after cleanup has already reported that it cannot terminate it.
+        finish(null, null);
+      }
+    };
+    const finish = (exitCode: number | null, exitSignal: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true;
+      feed.end();
+      clearTimeout(timer); clearTimeout(killTimer); clearTimeout(drainTimer);
+      signal?.removeEventListener("abort", abort);
+      child.stdout.destroy(); child.stderr.destroy();
+      child.unref(); // Unknown cleanup must not turn a reported failure into an exit hang.
+      const ended = checkEnded(exitCode, reason, plan.shell ? stderr.text() : "", process.platform, stdout.text());
+      const result: CommandResult = { ...base(), status: !reason && exitCode === 0 ? "pass" : "fail", exitCode, signal: exitSignal, reason, ...(ended ? { ended } : {}), ...(cleanupError ? { repair: "never" as const } : {}) };
+      if (!held || result.status === "pass" || reason) { if (held) sandbox?.finished(held); resolve(withSlowTest(result, stdout.slowTest || stderr.slowTest)); return; }
+      // A failure the sandbox caused says so, in the receipt and to the AI: "blocked by the sandbox (wanted to write /etc/hosts)".
+      const output = `${result.stderr}\n${result.stdout}`;
+      void blockedBySandbox(sandbox!, held!, output).then((blocked) => {
+        sandbox!.finished(held!);
+        // The sandbox's monitor does not see every refusal (a unix socket, a spawn): the check's own output says EPERM.
+        const denied = blocked ?? sandboxDenialInOutput(stderr.denial ?? stdout.denial ?? output);
+        resolve(denied ? { ...result, reason: denied, ended: "blocked" } : withSlowTest(result, stdout.slowTest || stderr.slowTest));
+      });
+    };
+    let stopped = false;
+    const stop = (message: string) => {
+      if (reason) return;
+      reason = message;
+      stopped = true;
+      void kill("SIGTERM");
+      killTimer = setTimeout(() => {
+        void kill("SIGKILL").then(() => {
+          // A missed/reparented worker can keep inherited pipes open even after
+          // cleanup reports stopped. The deadline must settle independently of close.
+          if (!settled) {
+            if (!closed) reportCleanup();
+            finish(null, child.signalCode);
+          }
+        });
+      }, 100);
+    };
+    const abort = () => stop("Verification cancelled");
+    const timer = setTimeout(() => stop(`Timed out after ${timeoutMs}ms`), timeoutMs);
+    signal?.addEventListener("abort", abort, { once: true });
+    child.stdout.on("data", (chunk: Buffer) => { stdout.add(chunk); feed.add(chunk); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr.add(chunk); feed.add(chunk); });
+    child.on("error", (error) => { reason = `Could not execute: ${error.message}`; });
+    // A shell can exit while a worker keeps its pipes open (or closes them and spins).
+    // Clean the owned group on root exit, not only on close/timeout. A check never owns
+    // a background service beyond its command's lifetime.
+    child.on("exit", async (exitCode, exitSignal) => {
+      await kill("SIGKILL");
+      if (settled || closed) return;
+      drainTimer = setTimeout(() => {
+        if (settled || closed) return;
+        reason = "Owned process cleanup is unconfirmed: output pipes remained open after command exit";
+        reportCleanup();
+        finish(exitCode, exitSignal);
+      }, 250);
+    });
+    child.on("close", async (exitCode, exitSignal) => {
+      closed = true;
+      clearTimeout(timer); clearTimeout(killTimer); clearTimeout(drainTimer);
+      // Drain cleanup even after a normal root exit, on every OS. The exit callback
+      // may still be stopping descendants; never discard an unknown outcome.
+      await kill("SIGKILL");
+      // Windows has no signals: a tree Casper stopped ends with exit code 1, which is not the command's own.
+      finish(stopped && process.platform === "win32" ? null : exitCode, exitSignal);
+    });
+    if (signal?.aborted) abort();
+  });
+}
+
+/** A test runner's own per-test time limit: bun ("this test timed out after 5000ms"), Jest ("Exceeded timeout of"),
+ * Vitest ("Test timed out in"), Mocha ("Timeout of 2000ms exceeded") and pytest-timeout ("Failed: Timeout >5.0s"). */
+const TEST_TIMED_OUT = /this test timed out after \d+ ?ms|Exceeded timeout of \d+ ?ms|Test timed out in \d+ ?ms|Timeout of \d+ ?ms exceeded|Failed: Timeout >\s?[\d.]+s/;
+export const testTimedOut = (output: string): boolean => TEST_TIMED_OUT.test(output);
+export const SLOW_TEST = "a test in it timed out (often a busy machine, not the code)";
+
+/** A failed run in which a test hit its own time limit did not finish either: often a busy machine (a full suite
+ * beside other work), not the code. It is unfinished, asked about like a check that timed out, never repaired on its own. */
+function withSlowTest(result: CommandResult, seen: boolean): CommandResult {
+  if (result.status !== "fail" || result.ended || !seen) return result;
+  return { ...result, ended: "timeout", reason: SLOW_TEST };
+}
+
+/** The sandbox's refusal for run `id`, waiting briefly for its monitor, which can report just after the command ends. */
+export async function blockedBySandbox(sandbox: Pick<CommandSandbox, "blockedReason">, id: string, output: string, waitMs = 200): Promise<string | undefined> {
+  const deadline = performance.now() + waitMs;
+  for (;;) {
+    const reason = sandbox.blockedReason(id, output);
+    if (reason || performance.now() >= deadline) return reason;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/** What a check prints when the sandbox, not the code, said no: EPERM / "Operation not permitted" (a unix socket, a
+ * loopback address, a spawned program, /dev/fd), "out of pty devices" (no terminal for a terminal test), a macOS
+ * service lookup refused by number (Chromium: "bootstrap_check_in ...: Permission denied (1100)"), or the sandbox's own wording. Only read for a run the sandbox held. */
+const DENIAL = /\bEPERM\b|operation not permitted|out of pty devices|blocked by the sandbox|sandbox[-\w]*\W+deny|\bdeny\(\d+\)|Permission denied \(\d+\)|\bbootstrap_check_in\b/i;
+export function sandboxDenialInOutput(output: string): string | undefined {
+  const found = DENIAL.exec(output)?.[0];
+  if (!found) return undefined;
+  const what = /^eperm$/i.test(found) ? "EPERM" : /not permitted/i.test(found) ? "Operation not permitted"
+    : /pty/i.test(found) ? "out of pty devices: no terminal" : "a sandbox denial";
+  return `blocked by the sandbox (the check printed ${what}; not a bug in your code)`;
+}
+
+/** Said when a check failed because the sandbox blocked something. */
+export const SANDBOX_CHECK_BLOCKED = "This check failed because the sandbox blocked something, not because of a bug in your code.";
