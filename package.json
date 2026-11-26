@@ -5,6 +5,9 @@
   "license": "MIT",
   "private": true,
   "type": "module",
+  "bin": {
+    "casper": "./src/cli.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "lint": "oxlint",

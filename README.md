@@ -6,7 +6,7 @@ casper-core is not an agent. It does not plan, chat, or repair on its own. It is
 
 ## Status
 
-Phase 0: the repository, the promise, and the non-goals exist. The kernel lands in Phase 1 and `casper verify` in Phase 2. Do not depend on this repository before 0.1.0.
+Phase 2: the kernel, the gate, the facts-only formatter, and the CLI work on a local workspace. The MCP server and skill pack land in Phase 4. Do not depend on this repository before 0.1.0.
 
 ## What it does
 
@@ -15,7 +15,40 @@ Phase 0: the repository, the promise, and the non-goals exist. The kernel lands 
 - Prints facts only: which checks ran, pass and fail counts, whether the proof held, which files changed, which declared requirements are still open.
 - Refuses. The gate has no path from `working` to `done` without evidence.
 
-Exit codes:
+## Usage
+
+Capture the workspace before the change:
+
+```sh
+casper baseline --command "bun test"
+# baseline: /tmp/casper-baseline-xxxx
+# files: 42
+```
+
+Make the change, then verify it:
+
+```sh
+casper verify --command "bun test" --require-proof --baseline /tmp/casper-baseline-xxxx
+```
+
+```text
+checks: test pass (1/1)
+proof: the check fails without the change and passes with it
+files: src/sum.js
+open requirements: none declared
+```
+
+A change the tests do not notice is refused with exit `2`:
+
+```text
+refused: the change is not proven
+checks: test pass (1/1)
+proof: the check passes without the change
+files: +src/helper.js
+open requirements: none declared
+```
+
+## Exit codes
 
 | Code | Meaning |
 | ---: | --- |

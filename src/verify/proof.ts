@@ -1,9 +1,10 @@
 import { constants, realpath as realpathCallback } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parentsStayInside } from "../platform/files";
 import { isOutside } from "../platform/inside";
+import { changesCode, isTestPath } from "../code";
 import { classifyPath, resolveToolPath, type PathContext } from "../platform/paths";
 import { isSecretFile } from "../secrets/names";
 import { checkInputs } from "../task/check-inputs";
@@ -46,27 +47,6 @@ function withoutRun(result: CommandResult & { exitCode: number }): WithoutRun {
   const ended = withoutEnded(result.exitCode, result.reason);
   const output = ended === "pass" ? "" : [result.stdout, result.stderr].map((text) => text.trim()).filter(Boolean).join("\n").slice(-OUTPUT_TAIL);
   return { exitCode: result.exitCode, ended, ...(result.reason ? { reason: result.reason } : {}), ...(output ? { output } : {}) };
-}
-
-/** Tests and their support files (helpers, fixtures under a test directory). They are what proves a
- * change, so the comparison keeps their new version; everything else is the change itself. */
-export function isTestPath(relative: string): boolean {
-  return /(?:^|\/)(?:__tests__|tests?|specs?)\//i.test(relative)
-    || /\.(?:test|spec)\.[^/.]+$/i.test(relative)
-    || /(?:^|\/)test_[^/]+\.py$/i.test(relative)
-    || /_(?:test|spec)\.[^/.]+$/i.test(relative);
-}
-
-/** Source code a behavior change lives in (tests excluded). Docs, data, assets and configuration are
- * not: editing them alone needs no proof. */
-export function isCodePath(relative: string): boolean {
-  return !isTestPath(relative) && /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|kts|scala|rb|php|cs|fs|swift|c|cc|cpp|cxx|h|hpp|m|mm|ex|exs|erl|clj|dart|lua|pl|sh|bash|zsh|vue|svelte)$/i.test(relative);
-}
-
-/** Whether a set of changes touches code that must be proven. */
-export function changesCode(changes: TreeChanges): boolean {
-  return [...changes.added, ...changes.modified, ...changes.removed]
-    .some((relative) => isCodePath(relative) && !relative.split("/").some((part) => Object.hasOwn(SKIPPED, part)));
 }
 
 /** Never copied: VCS internals, Casper's state, installed dependencies and virtual environments
@@ -120,6 +100,8 @@ async function copyEnv(root: string, tree: string, links: readonly string[]): Pr
 }
 const FILE_LIMIT = 20_000;
 const BYTE_LIMIT = 256 * 1024 * 1024;
+/** Written into a baseline's scratch folder so another process can open it from the printed handle. */
+const BASELINE_FILE = "baseline.json";
 
 interface Limits { fileLimit: number; byteLimit: number }
 
@@ -232,12 +214,42 @@ export class ChangeBaseline {
       const context = options.pathContext ?? {};
       const inputs = await safeInputs(root, options.command ?? "", context);
       const links = await cloneTree(root, path.join(scratch, "before"), limits, options.signal, inputs);
+      // The handle a later process reads: where the copy is, and what it linked instead of copying.
+      await writeFile(path.join(scratch, BASELINE_FILE), JSON.stringify({
+        version: 1, workspace: path.resolve(root), links, inputs, capturedAt: new Date().toISOString(),
+      }), "utf8");
       return new ChangeBaseline(scratch, path.join(scratch, "before"), limits, links, inputs, context);
     } catch (error) {
       await rm(scratch, { recursive: true, force: true });
       throw error;
     }
   }
+
+  /** Open a baseline a previous `capture` printed as its handle. The handle is the scratch folder. */
+  static async open(handle: string, options: { pathContext?: Omit<PathContext, "root"> } = {}): Promise<ChangeBaseline> {
+    const scratch = path.resolve(handle);
+    let meta: { version?: unknown; links?: unknown; inputs?: unknown };
+    try {
+      meta = JSON.parse(await readFile(path.join(scratch, BASELINE_FILE), "utf8"));
+    } catch {
+      throw new Error(`${handle} is not a baseline: no ${BASELINE_FILE}`);
+    }
+    if (meta.version !== 1 || !Array.isArray(meta.links) || !Array.isArray(meta.inputs)
+      || !meta.links.every((entry) => typeof entry === "string") || !meta.inputs.every((entry) => typeof entry === "string")) {
+      throw new Error(`${handle} is not a baseline: its ${BASELINE_FILE} is not a version 1 record`);
+    }
+    const tree = path.join(scratch, "before");
+    const info = await lstat(tree).catch(() => undefined);
+    if (!info?.isDirectory()) throw new Error(`${handle} is not a baseline: the copy is missing`);
+    return new ChangeBaseline(scratch, tree, { fileLimit: FILE_LIMIT, byteLimit: BYTE_LIMIT }, meta.links as string[],
+      meta.inputs as string[], options.pathContext ?? {});
+  }
+
+  /** The handle to print, so another process can `open` this baseline. */
+  get handle(): string { return this.scratch; }
+
+  /** The copy taken before the change. */
+  get beforeTree(): string { return this.tree; }
 
   /** Run `command` without the change's non-test edits, then (only if that fails) with them, each in a
    * fresh copy with dependencies linked from the workspace. Undefined when only tests changed. */

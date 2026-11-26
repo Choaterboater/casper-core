@@ -73,12 +73,13 @@ export const EXIT = {
 export type ExitCode = (typeof EXIT)[keyof typeof EXIT];
 
 /** The exit code for a set of facts. Order matters: a failed check outranks an unavailable proof,
- * and anything that did not run outranks a missing proof. An absent proof is a missing proof: the gate
- * fails closed. When nothing needed proving, the gate says so with a proof result rather than omitting it. */
-export function evidenceExitCode(evidence: Evidence): ExitCode {
+ * and anything that did not run outranks a missing proof. When `proofRequired` is unset it is true, so
+ * an absent proof fails closed. */
+export function evidenceExitCode(evidence: Evidence, options: { proofRequired?: boolean } = {}): ExitCode {
   if (evidence.checks.some((check) => check.status === "fail")) return EXIT.checksFailed;
   if (evidence.checks.some((check) => check.status === "blocked" || check.status === "skipped")) return EXIT.couldNotRun;
   if (!evidence.checks.length) return EXIT.couldNotRun;
+  if (options.proofRequired === false) return EXIT.complete;
   if (!evidence.proof) return EXIT.unproven;
   if (evidence.proof.status === "unavailable") return EXIT.couldNotRun;
   if (evidence.proof.status !== "proven") return EXIT.unproven;
