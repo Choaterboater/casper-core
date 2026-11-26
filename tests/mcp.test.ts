@@ -72,6 +72,7 @@ test("run_checks reports a failing check as a refusal", async () => {
   expect(result.isError).toBe(true);
   const text = (result.content as Array<{ text: string }>)[0]!.text;
   expect(text).toContain("refused: a check failed");
+  expect(text).toContain("exit: 1");
 });
 
 test("a proven change returns evidence and the host may claim it", async () => {
@@ -89,6 +90,7 @@ test("a proven change returns evidence and the host may claim it", async () => {
   expect(result.isError).toBeFalsy();
   const text = (result.content as Array<{ text: string }>)[0]!.text;
   expect(text).toContain("proof: the check fails without the change and passes with it");
+  expect(text).toContain("exit: 0");
   expect(text).not.toMatch(/Verified|Done/);
 
   // What a host following the skill does with the answer.
@@ -111,6 +113,8 @@ test("an unproven change is refused and the host does not claim it", async () =>
   expect(result.isError).toBe(true);
   const text = (result.content as Array<{ text: string }>)[0]!.text;
   expect(text).toContain("refused: the change is not proven");
+  // The host has no shell, so the code must be quotable from the text alone.
+  expect(text).toContain("exit: 2");
 
   const host = { claimedDone: exitOf(result) === EXIT.complete };
   expect(host.claimedDone).toBe(false);

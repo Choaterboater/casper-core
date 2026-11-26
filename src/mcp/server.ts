@@ -89,6 +89,12 @@ function result(text: string, structured: Record<string, unknown>, failed: boole
   return { content: [{ type: "text", text }], structuredContent: structured, ...(failed ? { isError: true } : {}) };
 }
 
+/** A host has no shell to read `$?` from, and not every host shows structuredContent to the model,
+ * so the code the gate answered with is in the text too. */
+function withExit(text: string, code: number): string {
+  return `${text}\nexit: ${code}`;
+}
+
 function workspaceOf(args: Record<string, unknown>): string {
   return path.resolve(typeof args.path === "string" && args.path ? args.path : process.cwd());
 }
@@ -131,7 +137,7 @@ async function verifyTool(args: Record<string, unknown>): Promise<ToolResult> {
 
   const proofRequired = requireProof && (!baseline || changesCode(evidence.files));
   const code = evidenceExitCode(evidence, { proofRequired });
-  const text = code === EXIT.complete ? formatEvidence(evidence) : formatRefusal(evidence, code);
+  const text = withExit(code === EXIT.complete ? formatEvidence(evidence) : formatRefusal(evidence, code), code);
   return result(text, { exitCode: code, evidence }, code !== EXIT.complete);
 }
 
@@ -147,7 +153,7 @@ async function runChecksTool(args: Record<string, unknown>): Promise<ToolResult>
 
   const evidence: Evidence = await runChecks({ context: { workspace, home: os.homedir(), sandbox: false }, checks });
   const code = evidenceExitCode(evidence, { proofRequired: false });
-  const text = code === EXIT.complete ? formatEvidence(evidence) : formatRefusal(evidence, code);
+  const text = withExit(code === EXIT.complete ? formatEvidence(evidence) : formatRefusal(evidence, code), code);
   return result(text, { exitCode: code, evidence }, code !== EXIT.complete);
 }
 

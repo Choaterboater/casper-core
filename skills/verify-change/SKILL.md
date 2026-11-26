@@ -36,10 +36,12 @@ Call `verify_change`:
 
 ## Reading the answer
 
-- `exitCode` 0: the checks passed and the check fails without the change. You may quote the facts.
-- `exitCode` 1: a check failed. Fix it or report it.
-- `exitCode` 2: the change is not proven. The check passes without it. Add a test that exercises the change, or say the behavior is unverified.
-- `exitCode` 3: the checks could not run (no baseline, no command, environment problem). Fix the setup first.
+Every answer from `verify_change` and `run_checks` ends with `exit: N`. Quote that number; do not infer it.
+
+- `exit` 0: the checks passed and the check fails without the change. You may quote the facts.
+- `exit` 1: a check failed. Fix it or report it.
+- `exit` 2: the change is not proven. The check passes without it. Add a test that exercises the change, or say the behavior is unverified.
+- `exit` 3: the checks could not run (no baseline, no command, environment problem). Fix the setup first.
 
 When `isError` is true, do not claim the change works. Quote the facts the tool returned and say what remains.
 
