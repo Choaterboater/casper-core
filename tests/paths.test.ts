@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { classifyPath, privatePlace, realpathLongest, resolveToolPath } from "../src/platform/paths";
@@ -78,5 +79,9 @@ test("resolveToolPath expands ~ and resolves against the workspace", async () =>
 test("realpathLongest keeps the part of a path that does not exist", async () => {
   const { workspace } = await place();
   const missing = path.join(workspace, "src", "not-there.ts");
-  expect(realpathLongest(missing)).toBe(missing);
+  const resolved = realpathLongest(missing);
+  // The part that exists comes back canonical: a temp folder can be a symlink (macOS /var) or an 8.3 name (Windows).
+  const real = process.platform === "win32" ? realpathSync.native : realpathSync;
+  expect(resolved.endsWith(`${path.sep}not-there.ts`)).toBe(true);
+  expect(real(path.dirname(resolved))).toBe(path.dirname(resolved));
 });

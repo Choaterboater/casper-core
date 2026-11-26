@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { chmod, rm } from "node:fs/promises";
 import path from "node:path";
 import { diffSnapshots, snapshotTree } from "../src/task/changes";
 import { removeDir, tempDir, writeFiles } from "./support/fixtures";
@@ -35,9 +36,11 @@ test("dependency trees, git and caches are not snapshotted", async () => {
 });
 
 test("a folder git can list is snapshotted from git, so ignored files are left out", async () => {
+  try { execFileSync("git", ["--version"], { stdio: "ignore" }); } catch { return; } // no git here: nothing to list
   root = await tempDir("changes-git");
   await writeFiles(root, { "kept.txt": "k\n", "ignored.txt": "i\n", ".gitignore": "ignored.txt\n" });
-  await mkdir(path.join(root, ".git"), { recursive: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
   const snapshot = await snapshotTree(root);
   expect(snapshot.has("kept.txt")).toBe(true);
   expect(snapshot.has(".gitignore")).toBe(true);
@@ -58,7 +61,7 @@ test("an executable bit is part of a file's identity where the platform has one"
   if (process.platform === "win32") return; // Windows has no such bit
   await writeFiles(root, { "run.sh": "#!/bin/sh\necho ok\n" });
   const before = await snapshotTree(root);
-  await writeFile(path.join(root, "run.sh"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
+  await chmod(path.join(root, "run.sh"), 0o755);
   const after = await snapshotTree(root);
   expect(after.get("run.sh")).not.toBe(before.get("run.sh"));
 });
