@@ -63,6 +63,19 @@ export async function verifyChange(input: VerifyChangeInput): Promise<Evidence> 
   return { checks, ...(proof ? { proof } : {}), files, requirements: [...(input.requirements ?? [])], ranAt };
 }
 
+/** Run the checks only, with no comparison. The caller reads the facts and decides. */
+export function runChecks(input: {
+  context: TaskContext;
+  checks: readonly CheckSpec[];
+  signal?: AbortSignal;
+}): Promise<Evidence> {
+  return verifyChange({
+    context: input.context,
+    checks: input.checks,
+    ...(input.signal ? { signal: input.signal } : {}),
+  });
+}
+
 /** A baseline that exists but shows no code change needs no comparison: there is nothing to prove. */
 function provenAlready(reason: string): ProofResult {
   return { status: "proven", reason };

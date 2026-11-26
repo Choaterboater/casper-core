@@ -6,7 +6,7 @@ casper-core is not an agent. It does not plan, chat, or repair on its own. It is
 
 ## Status
 
-Phase 3: the kernel, the gate, the CLI, and the one approval broker work on a local workspace. The MCP server and skill pack land in Phase 4. Do not depend on this repository before 0.1.0.
+Phase 4: the kernel, the gate, the CLI, the approval broker, the MCP server, and the skill pack exist. Release 0.1.0 and three-platform CI land in Phase 5. Do not depend on this repository before 0.1.0.
 
 ## What it does
 
@@ -56,6 +56,22 @@ open requirements: none declared
 | `1` | checks failed |
 | `2` | unproven: checks pass, proof missing or failed |
 | `3` | could not run: no command, no baseline, environment problem |
+
+## MCP
+
+```sh
+casper-mcp
+```
+
+Three tools: `verify_change`, `run_checks`, `undo_last`. The skill at `skills/verify-change/SKILL.md` tells a host to capture a baseline before editing, call `verify_change` afterwards, and not claim completion when the gate refuses.
+
+```json
+{
+  "mcpServers": {
+    "casper-core": { "command": "casper-mcp" }
+  }
+}
+```
 
 ## Approvals
 
