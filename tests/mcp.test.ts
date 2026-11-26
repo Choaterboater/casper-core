@@ -40,10 +40,28 @@ async function connect(): Promise<Client> {
 const exitOf = (result: unknown): number | undefined =>
   (result as { structuredContent?: { exitCode?: number } }).structuredContent?.exitCode;
 
-test("the server lists the three tools", async () => {
+test("the server lists the four tools", async () => {
   const connected = await connect();
   const listed = await connected.listTools();
-  expect(listed.tools.map((tool) => tool.name).sort()).toEqual(["run_checks", "undo_last", "verify_change"]);
+  expect(listed.tools.map((tool) => tool.name).sort()).toEqual(["capture_baseline", "run_checks", "undo_last", "verify_change"]);
+});
+
+test("capture_baseline returns a handle the gate can prove with", async () => {
+  const workspace = await project();
+  const connected = await connect();
+  const captured = await connected.callTool({ name: "capture_baseline", arguments: { path: workspace, command: "bun test" } });
+  expect(captured.isError).toBeFalsy();
+  const handle = (captured.structuredContent as { baseline: string }).baseline;
+  expect((captured.content as Array<{ text: string }>)[0]!.text).toBe(`baseline: ${handle}`);
+  baseline = await ChangeBaseline.open(handle, { pathContext: { home } });
+
+  await writeFiles(workspace, { "src/sum.js": FIXED_SUM });
+  const result = await connected.callTool({
+    name: "verify_change",
+    arguments: { path: workspace, command: "bun test", require_proof: true, baseline: handle },
+  });
+  expect(exitOf(result)).toBe(EXIT.complete);
+  expect(result.isError).toBeFalsy();
 });
 
 test("run_checks reports a failing check as a refusal", async () => {

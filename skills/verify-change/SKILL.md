@@ -7,19 +7,24 @@ description: Verify a change with casper-core before claiming it works. Use when
 
 casper-core is an evidence gate. It runs the project's own checks and proves the change matters. It prints facts; it never prints a verdict.
 
+Do not edit a file before the baseline exists. If you already edited, say so: a baseline taken now would contain your change and could not prove anything.
+
 ## Before the change
 
-Capture the workspace so the gate has something to compare with:
+Call `capture_baseline` with the project's test command:
 
-```sh
-casper baseline --command "<the project's test command>"
+```json
+{
+  "command": "<the project's test command>",
+  "path": "<the project folder, when it is not the server's working directory>"
+}
 ```
 
 Keep the `baseline:` handle. It is a folder path.
 
 ## After the change
 
-Call the `verify_change` tool:
+Call `verify_change`:
 
 ```json
 {
@@ -31,7 +36,7 @@ Call the `verify_change` tool:
 
 ## Reading the answer
 
-- `isError` false and `exitCode` 0: the checks passed and the check fails without the change. You may quote the facts.
+- `exitCode` 0: the checks passed and the check fails without the change. You may quote the facts.
 - `exitCode` 1: a check failed. Fix it or report it.
 - `exitCode` 2: the change is not proven. The check passes without it. Add a test that exercises the change, or say the behavior is unverified.
 - `exitCode` 3: the checks could not run (no baseline, no command, environment problem). Fix the setup first.

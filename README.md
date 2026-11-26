@@ -74,7 +74,7 @@ open requirements: none declared
 casper-mcp
 ```
 
-Three tools: `verify_change`, `run_checks`, `undo_last`. The skill at `skills/verify-change/SKILL.md` tells a host to capture a baseline before editing, call `verify_change` afterwards, and not claim completion when the gate refuses.
+Four tools: `capture_baseline`, `verify_change`, `run_checks`, `undo_last`. The skill at `skills/verify-change/SKILL.md` tells a host to capture a baseline before editing, call `verify_change` afterwards, and not claim completion when the gate refuses.
 
 ```json
 {

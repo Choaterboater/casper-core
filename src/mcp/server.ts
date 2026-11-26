@@ -19,6 +19,19 @@ const STATE_DIR = path.join(os.tmpdir(), "casper-core-undo");
 
 const TOOLS = [
   {
+    name: "capture_baseline",
+    description: "Copy the workspace before you edit it. Call this first, keep the handle, and pass it to verify_change so the gate can prove the change matters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The project's test command, exactly as the project runs it." },
+        path: { type: "string", description: "Workspace folder. Default: the server's working directory." },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "verify_change",
     description: "Run the project's checks and prove the change matters: the check must fail without it. Returns facts only. When isError is true or exitCode is not 0, do not claim the change is done.",
     inputSchema: {
@@ -27,7 +40,7 @@ const TOOLS = [
         command: { type: "string", description: "The project's test command, exactly as the project runs it." },
         name: { type: "string", description: "Check name. Default: test." },
         require_proof: { type: "boolean", description: "Compare with the baseline: the check must fail without the change." },
-        baseline: { type: "string", description: "Handle printed by `casper baseline` before the change." },
+        baseline: { type: "string", description: "Handle from capture_baseline, taken before the change." },
         requirements: { type: "array", items: { type: "string" }, description: "Requirements declared by the caller, echoed back." },
         path: { type: "string", description: "Workspace folder. Default: the server's working directory." },
       },
@@ -62,7 +75,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        baseline: { type: "string", description: "Handle printed by `casper baseline`. Default: the last one this server saw." },
+        baseline: { type: "string", description: "Handle from capture_baseline. Default: the last one this server saw." },
         path: { type: "string", description: "Workspace folder. Default: the server's working directory." },
       },
       additionalProperties: false,
@@ -89,6 +102,14 @@ async function openBaseline(workspace: string, args: Record<string, unknown>): P
   const handle = typeof args.baseline === "string" && args.baseline ? args.baseline : lastBaseline.get(workspace)?.handle;
   if (!handle) return undefined;
   return ChangeBaseline.open(handle, { pathContext: { home: os.homedir() } });
+}
+
+async function captureTool(args: Record<string, unknown>): Promise<ToolResult> {
+  const workspace = workspaceOf(args);
+  if (typeof args.command !== "string" || !args.command) throw new Error("command is required");
+  const baseline = await ChangeBaseline.capture(workspace, { command: args.command, pathContext: { home: os.homedir() } });
+  lastBaseline.set(workspace, baseline);
+  return result(`baseline: ${baseline.handle}`, { exitCode: 0, baseline: baseline.handle }, false);
 }
 
 async function verifyTool(args: Record<string, unknown>): Promise<ToolResult> {
@@ -152,6 +173,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = (request.params.arguments ?? {}) as Record<string, unknown>;
   try {
     switch (request.params.name) {
+      case "capture_baseline": return await captureTool(args);
       case "verify_change": return await verifyTool(args);
       case "run_checks": return await runChecksTool(args);
       case "undo_last": return await undoTool(args);
